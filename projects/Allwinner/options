@@ -41,7 +41,7 @@
     UBOOT_VERSION="default"
 
   # Configuration for u-boot
-    UBOOT_CONFIG="orangepi_pc_defconfig"
+    UBOOT_CONFIG="orangepi_2_defconfig"
 
   # Target Configfile for u-boot
     UBOOT_CONFIGFILE=""
@@ -50,7 +50,7 @@
     KERNEL_TARGET="zImage"
 
   # Kernel extra targets to build
-    KERNEL_UBOOT_EXTRA_TARGET="sun8i-h3-orangepi-pc.dtb"
+    KERNEL_UBOOT_EXTRA_TARGET="sun8i-h3-orangepi-2.dtb"
 
   # Additional kernel make parameters (for example to specify the u-boot loadaddress)
     KERNEL_MAKE_EXTRACMD="dtbs"

@@ -44,7 +44,8 @@ PKG_CONFIGURE_OPTS_HOST="--enable-static --disable-shared \
                          --without-hesiod \
                          --without-x \
                          --with-db-type-preference= \
-                         --disable-heimdal-documentation"
+                         --disable-heimdal-documentation \
+                         --disable-otp"
 
 makeinstall_host() {
   mkdir -p $TOOLCHAIN/bin
