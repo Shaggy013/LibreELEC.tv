@@ -50,5 +50,5 @@ post_makeinstall_host() {
   python ./pylibfdt/setup.py build_ext --inplace
   python ./pylibfdt/setup.py install --prefix=$TOOLCHAIN
 
-  touch $TOOLCHAIN/lib/python2.7/site-packages/pylibfdt/__init__.py
+  touch $TOOLCHAIN/lib/$PKG_PYTHON_VERSION/site-packages/pylibfdt/__init__.py
 }
