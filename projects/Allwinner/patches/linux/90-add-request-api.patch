@@ -1,0 +1,2715 @@
+From 4a434bd2a1a37571765914c3e09d690f6ccccc14 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 7 Apr 2015 15:48:43 +0200
+Subject: [PATCH 01/31] videodev2.h: add max_reqs to struct v4l2_query_ext_ctrl
+
+struct v4l2_query_ext_ctrl is extended with a new 'max_reqs' field to store
+the maximum number of outstanding requests that contain this control.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ioctl.c | 7 +++++--
+ include/uapi/linux/videodev2.h       | 4 +++-
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index cab63bb49c97..26e8edb01545 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -526,12 +526,15 @@ static void v4l_print_query_ext_ctrl(const void *arg, bool write_only)
+ {
+ 	const struct v4l2_query_ext_ctrl *p = arg;
+ 
+-	pr_cont("id=0x%x, type=%d, name=%.*s, min/max=%lld/%lld, step=%lld, default=%lld, flags=0x%08x, elem_size=%u, elems=%u, nr_of_dims=%u, dims=%u,%u,%u,%u\n",
++	pr_cont("id=0x%x, type=%d, name=%.*s, min/max=%lld/%lld, "
++		"step=%lld, default=%lld, flags=0x%08x, elem_size=%u, elems=%u, "
++		"nr_of_dims=%u, dims=%u,%u,%u,%u, max_reqs=%u, request=%u\n",
+ 			p->id, p->type, (int)sizeof(p->name), p->name,
+ 			p->minimum, p->maximum,
+ 			p->step, p->default_value, p->flags,
+ 			p->elem_size, p->elems, p->nr_of_dims,
+-			p->dims[0], p->dims[1], p->dims[2], p->dims[3]);
++			p->dims[0], p->dims[1], p->dims[2], p->dims[3],
++			p->max_reqs, p->request);
+ }
+ 
+ static void v4l_print_querymenu(const void *arg, bool write_only)
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 45cf7359822c..2ab155d18cec 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1637,7 +1637,9 @@ struct v4l2_query_ext_ctrl {
+ 	__u32                elems;
+ 	__u32                nr_of_dims;
+ 	__u32                dims[V4L2_CTRL_MAX_DIMS];
+-	__u32		     reserved[32];
++	__u32                max_reqs;
++	__u32                request;
++	__u32		     reserved[30];
+ };
+ 
+ /*  Used in the VIDIOC_QUERYMENU ioctl for querying menu items */
+-- 
+2.14.2
+
+From 8b1ed8e4151c45a67afcdbe706e423c31733e061 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 16 Dec 2013 16:45:24 +0100
+Subject: [PATCH 02/31] videodev2.h: add request to v4l2_ext_controls
+
+The ctrl_class is fairly pointless when used with drivers that use the control
+framework: you can just fill in 0 and it will just work fine. There are still
+some old unconverted drivers that do not support 0 and instead want the control
+class there. The idea being that all controls in the list all belong to that
+class. This was done to simplify drivers in the absence of the control framework.
+
+When using the control framework the framework itself is smart enough to allow
+controls of any class to be included in the control list.
+
+Since request IDs are in the range 1..65535 (or so, in any case a relatively
+small non-zero positive integer) it makes sense to effectively rename ctrl_class
+to request. Set it to 0 and you get the normal behavior (you change the current
+control value), set it to a request ID and you get/set the control for
+that request.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ include/uapi/linux/videodev2.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 2ab155d18cec..6772a6397357 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1575,6 +1575,7 @@ struct v4l2_ext_controls {
+ 		__u32 ctrl_class;
+ #endif
+ 		__u32 which;
++		__u32 request;
+ 	};
+ 	__u32 count;
+ 	__u32 error_idx;
+-- 
+2.14.2
+
+From b9974950e86b78b758a58945038e6257847db760 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Thu, 9 Apr 2015 13:30:35 +0200
+Subject: [PATCH 03/31] videodev2.h: add request field to v4l2_buffer.
+
+When queuing buffers allow for passing the request ID that
+should be associated with this buffer. Split the u32 reserved2 field
+into two u16 fields, one for request, one with the old reserved2 name.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Florent Revest <florent.revest@free-electrons.com>
+---
+ drivers/media/usb/cpia2/cpia2_v4l.c           | 1 +
+ drivers/media/v4l2-core/v4l2-compat-ioctl32.c | 4 +++-
+ drivers/media/v4l2-core/v4l2-ioctl.c          | 5 +++--
+ drivers/media/v4l2-core/videobuf2-v4l2.c      | 3 +++
+ include/media/videobuf2-v4l2.h                | 2 ++
+ include/uapi/linux/videodev2.h                | 4 +++-
+ 6 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/usb/cpia2/cpia2_v4l.c b/drivers/media/usb/cpia2/cpia2_v4l.c
+index 7122023e7004..3672338c7ff1 100644
+--- a/drivers/media/usb/cpia2/cpia2_v4l.c
++++ b/drivers/media/usb/cpia2/cpia2_v4l.c
+@@ -948,6 +948,7 @@ static int cpia2_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
+ 	buf->sequence = cam->buffers[buf->index].seq;
+ 	buf->m.offset = cam->buffers[buf->index].data - cam->frame_buffer;
+ 	buf->length = cam->frame_size;
++	buf->request = 0;
+ 	buf->reserved2 = 0;
+ 	buf->reserved = 0;
+ 	memset(&buf->timecode, 0, sizeof(buf->timecode));
+diff --git a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+index 821f2aa299ae..26d74430349d 100644
+--- a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
++++ b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+@@ -370,7 +370,8 @@ struct v4l2_buffer32 {
+ 		__s32		fd;
+ 	} m;
+ 	__u32			length;
+-	__u32			reserved2;
++	__u16			request;
++	__u16			reserved2;
+ 	__u32			reserved;
+ };
+ 
+@@ -533,6 +534,7 @@ static int put_v4l2_buffer32(struct v4l2_buffer *kp, struct v4l2_buffer32 __user
+ 		put_user(kp->timestamp.tv_usec, &up->timestamp.tv_usec) ||
+ 		copy_to_user(&up->timecode, &kp->timecode, sizeof(struct v4l2_timecode)) ||
+ 		put_user(kp->sequence, &up->sequence) ||
++		put_user(kp->request, &up->request) ||
+ 		put_user(kp->reserved2, &up->reserved2) ||
+ 		put_user(kp->reserved, &up->reserved) ||
+ 		put_user(kp->length, &up->length))
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 26e8edb01545..1e8962145983 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -437,13 +437,14 @@ static void v4l_print_buffer(const void *arg, bool write_only)
+ 	const struct v4l2_plane *plane;
+ 	int i;
+ 
+-	pr_cont("%02ld:%02d:%02d.%08ld index=%d, type=%s, flags=0x%08x, field=%s, sequence=%d, memory=%s",
++	pr_cont("%02ld:%02d:%02d.%08ld index=%d, type=%s, request=%u, "
++		"flags=0x%08x, field=%s, sequence=%d, memory=%s",
+ 			p->timestamp.tv_sec / 3600,
+ 			(int)(p->timestamp.tv_sec / 60) % 60,
+ 			(int)(p->timestamp.tv_sec % 60),
+ 			(long)p->timestamp.tv_usec,
+ 			p->index,
+-			prt_names(p->type, v4l2_type_names),
++			prt_names(p->type, v4l2_type_names), p->request,
+ 			p->flags, prt_names(p->field, v4l2_field_names),
+ 			p->sequence, prt_names(p->memory, v4l2_memory_names));
+ 
+diff --git a/drivers/media/v4l2-core/videobuf2-v4l2.c b/drivers/media/v4l2-core/videobuf2-v4l2.c
+index 0c0669976bdc..06537d0f9125 100644
+--- a/drivers/media/v4l2-core/videobuf2-v4l2.c
++++ b/drivers/media/v4l2-core/videobuf2-v4l2.c
+@@ -203,6 +203,7 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 	b->timestamp = ns_to_timeval(vb->timestamp);
+ 	b->timecode = vbuf->timecode;
+ 	b->sequence = vbuf->sequence;
++	b->request = vbuf->request;
+ 	b->reserved2 = 0;
+ 	b->reserved = 0;
+ 
+@@ -436,6 +437,8 @@ static int __fill_vb2_buffer(struct vb2_buffer *vb,
+ 		vbuf->flags &= ~V4L2_BUFFER_OUT_FLAGS;
+ 	}
+ 
++	vbuf->request = b->request;
++
+ 	return 0;
+ }
+ 
+diff --git a/include/media/videobuf2-v4l2.h b/include/media/videobuf2-v4l2.h
+index 036127c54bbf..3029b763ab58 100644
+--- a/include/media/videobuf2-v4l2.h
++++ b/include/media/videobuf2-v4l2.h
+@@ -30,6 +30,7 @@
+  * @flags:	buffer informational flags
+  * @field:	enum v4l2_field; field order of the image in the buffer
+  * @timecode:	frame timecode
++ * @request:	this buffer should use this request
+  * @sequence:	sequence count of this frame
+  *
+  * Should contain enough information to be able to cover all the fields
+@@ -41,6 +42,7 @@ struct vb2_v4l2_buffer {
+ 	__u32			flags;
+ 	__u32			field;
+ 	struct v4l2_timecode	timecode;
++	__u16			request;
+ 	__u32			sequence;
+ };
+ 
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 6772a6397357..47a37b63f369 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -896,6 +896,7 @@ struct v4l2_plane {
+  * @length:	size in bytes of the buffer (NOT its payload) for single-plane
+  *		buffers (when type != *_MPLANE); number of elements in the
+  *		planes array for multi-plane buffers
++ * @request: this buffer should use this request
+  *
+  * Contains data exchanged by application and driver using one of the Streaming
+  * I/O methods.
+@@ -919,7 +920,8 @@ struct v4l2_buffer {
+ 		__s32		fd;
+ 	} m;
+ 	__u32			length;
+-	__u32			reserved2;
++	__u16			request;
++	__u16			reserved2;
+ 	__u32			reserved;
+ };
+ 
+-- 
+2.14.2
+
+From 59f03e2d992ab03c810f3d16749f526813ffae91 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 12:16:58 +0200
+Subject: [PATCH 04/31] vb2: add allow_requests flag
+
+The driver has to set allow_requests explicitly in order to allow
+queuing or preparing buffers for a specific request ID.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/videobuf2-v4l2.c | 5 +++++
+ include/media/videobuf2-core.h           | 3 +++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/videobuf2-v4l2.c b/drivers/media/v4l2-core/videobuf2-v4l2.c
+index 06537d0f9125..d7676f5e9e31 100644
+--- a/drivers/media/v4l2-core/videobuf2-v4l2.c
++++ b/drivers/media/v4l2-core/videobuf2-v4l2.c
+@@ -178,6 +178,11 @@ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!q->v4l2_allow_requests && b->request) {
++		dprintk(1, "%s: unsupported request ID\n", opname);
++		return -EINVAL;
++	}
++
+ 	return __verify_planes_array(q->bufs[b->index], b);
+ }
+ 
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index cb97c224be73..79671c757703 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -487,6 +487,8 @@ struct vb2_buf_ops {
+  * @last_buffer_dequeued: used in poll() and DQBUF to immediately return if the
+  *		last decoded buffer was already dequeued. Set for capture queues
+  *		when a buffer with the V4L2_BUF_FLAG_LAST is dequeued.
++ * @v4l2_allow_requests: allow request != 0 to be passed to the driver, V4L2
++ *		specific.
+  * @fileio:	file io emulator internal data, used only if emulator is active
+  * @threadio:	thread io internal data, used only if thread is active
+  */
+@@ -537,6 +539,7 @@ struct vb2_queue {
+ 	unsigned int			is_output:1;
+ 	unsigned int			copy_timestamp:1;
+ 	unsigned int			last_buffer_dequeued:1;
++	unsigned int			v4l2_allow_requests:1;
+ 
+ 	struct vb2_fileio_data		*fileio;
+ 	struct vb2_threadio_data	*threadio;
+-- 
+2.14.2
+
+From 5329ca0ea37b87d08fc3d838ab020ec5006c3214 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 13 Apr 2015 15:03:03 +0200
+Subject: [PATCH 05/31] v4l2-ctrls: add request support
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 231 ++++++++++++++++++++++++++++++-----
+ drivers/media/v4l2-core/v4l2-ioctl.c |   8 ++
+ include/media/v4l2-ctrls.h           |  20 +++
+ 3 files changed, 229 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index dd1db678718c..e826c5bc0af8 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -1264,6 +1264,96 @@ static void send_event(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 changes)
+ 			v4l2_event_queue_fh(sev->fh, &ev);
+ }
+ 
++static int alloc_requests(struct v4l2_ctrl *ctrl)
++{
++	unsigned i;
++
++	ctrl->request_lists = kmalloc_array(VIDEO_MAX_FRAME,
++					sizeof(struct list_head), GFP_KERNEL);
++	if (ctrl->request_lists == NULL)
++		return -ENOMEM;
++	for (i = 0; i < VIDEO_MAX_FRAME; i++)
++		INIT_LIST_HEAD(ctrl->request_lists + i);
++	return 0;
++}
++
++static struct v4l2_ctrl_req *get_request(struct v4l2_ctrl *ctrl, unsigned request)
++{
++	struct v4l2_ctrl_req *req;
++	struct list_head *head;
++
++	if (ctrl->request_lists == NULL)
++		return NULL;
++	head = ctrl->request_lists + (request % VIDEO_MAX_FRAME);
++	list_for_each_entry(req, head, node)
++		if (req->request == request)
++			return req;
++	return NULL;
++}
++
++static int add_request(struct v4l2_ctrl *ctrl, unsigned request,
++		       struct v4l2_ctrl_req **p_req)
++{
++	struct v4l2_ctrl_req *req;
++	struct list_head *head;
++	unsigned idx;
++	int ret;
++
++	if (ctrl->nr_of_requests == ctrl->max_reqs)
++		return -ENOSPC;
++
++	if (ctrl->request_lists == NULL) {
++		ret = alloc_requests(ctrl);
++		if (ret)
++			return ret;
++	}
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (req == NULL)
++		return -ENOMEM;
++	req->ptr.p = kcalloc(ctrl->elems, ctrl->elem_size, GFP_KERNEL);
++	req->request = request;
++	if (req->ptr.p == NULL) {
++		kfree(req);
++		return -ENOMEM;
++	}
++	head = ctrl->request_lists + (request % VIDEO_MAX_FRAME);
++	for (idx = 0; idx < ctrl->elems; idx++)
++		ctrl->type_ops->init(ctrl, idx, req->ptr);
++	ctrl->nr_of_requests++;
++	list_add(&req->node, head);
++	if (p_req)
++		*p_req = req;
++	return 0;
++}
++
++static void del_request(struct v4l2_ctrl *ctrl, struct v4l2_ctrl_req *req)
++{
++	list_del(&req->node);
++	ctrl->nr_of_requests--;
++	kfree(req->ptr.p);
++	kfree(req);
++}
++
++static void free_requests(struct v4l2_ctrl *ctrl)
++{
++	unsigned idx;
++
++	if (!ctrl->request_lists)
++		return;
++
++	for (idx = 0; idx < VIDEO_MAX_FRAME; idx++) {
++		struct list_head *head = ctrl->request_lists + idx;
++
++		while (!list_empty(head)) {
++			struct v4l2_ctrl_req *req =
++				list_first_entry(head, struct v4l2_ctrl_req, node);
++			del_request(ctrl, req);
++		}
++	}
++	kfree(ctrl->request_lists);
++	ctrl->request_lists = NULL;
++}
++
+ static bool std_equal(const struct v4l2_ctrl *ctrl, u32 idx,
+ 		      union v4l2_ctrl_ptr ptr1,
+ 		      union v4l2_ctrl_ptr ptr2)
+@@ -1511,6 +1601,15 @@ static int cur_to_user(struct v4l2_ext_control *c,
+ 	return ptr_to_user(c, ctrl, ctrl->p_cur);
+ }
+ 
++/* Helper function: copy the request's control value back to the caller */
++static int request_to_user(struct v4l2_ext_control *c,
++		       struct v4l2_ctrl *ctrl)
++{
++	if (ctrl->request == NULL)
++		return ptr_to_user(c, ctrl, ctrl->p_new);
++	return ptr_to_user(c, ctrl, ctrl->request->ptr);
++}
++
+ /* Helper function: copy the new control value back to the caller */
+ static int new_to_user(struct v4l2_ext_control *c,
+ 		       struct v4l2_ctrl *ctrl)
+@@ -1629,6 +1728,13 @@ static void new_to_cur(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ 	}
+ }
+ 
++/* Helper function: copy the new control value to the request */
++static void new_to_request(struct v4l2_ctrl *ctrl)
++{
++	if (ctrl)
++		ptr_to_ptr(ctrl, ctrl->p_new, ctrl->request->ptr);
++}
++
+ /* Copy the current value to the new value */
+ static void cur_to_new(struct v4l2_ctrl *ctrl)
+ {
+@@ -1776,6 +1882,7 @@ void v4l2_ctrl_handler_free(struct v4l2_ctrl_handler *hdl)
+ 		list_del(&ctrl->node);
+ 		list_for_each_entry_safe(sev, next_sev, &ctrl->ev_subs, node)
+ 			list_del(&sev->node);
++		free_requests(ctrl);
+ 		kvfree(ctrl);
+ 	}
+ 	kvfree(hdl->buckets);
+@@ -2122,8 +2229,10 @@ struct v4l2_ctrl *v4l2_ctrl_new_custom(struct v4l2_ctrl_handler *hdl,
+ 			is_menu ? cfg->menu_skip_mask : step, def,
+ 			cfg->dims, cfg->elem_size,
+ 			flags, qmenu, qmenu_int, priv);
+-	if (ctrl)
++	if (ctrl) {
+ 		ctrl->is_private = cfg->is_private;
++		ctrl->max_reqs = cfg->max_reqs;
++	}
+ 	return ctrl;
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_new_custom);
+@@ -2300,18 +2409,26 @@ EXPORT_SYMBOL(v4l2_ctrl_radio_filter);
+ void v4l2_ctrl_cluster(unsigned ncontrols, struct v4l2_ctrl **controls)
+ {
+ 	bool has_volatiles = false;
++	unsigned max_reqs;
+ 	int i;
+ 
+ 	/* The first control is the master control and it must not be NULL */
+ 	if (WARN_ON(ncontrols == 0 || controls[0] == NULL))
+ 		return;
+ 
++	max_reqs = controls[0]->max_reqs;
+ 	for (i = 0; i < ncontrols; i++) {
+ 		if (controls[i]) {
+ 			controls[i]->cluster = controls;
+ 			controls[i]->ncontrols = ncontrols;
+ 			if (controls[i]->flags & V4L2_CTRL_FLAG_VOLATILE)
+ 				has_volatiles = true;
++			/*
++			 * The max_reqs value should be the same for all
++			 * controls inside the cluster.
++			 */
++			if (WARN_ON(controls[i]->max_reqs != max_reqs))
++				controls[i]->max_reqs = max_reqs;
+ 		}
+ 	}
+ 	controls[0]->has_volatiles = has_volatiles;
+@@ -2476,6 +2593,7 @@ int __v4l2_ctrl_handler_setup(struct v4l2_ctrl_handler *hdl)
+ 				cur_to_new(master->cluster[i]);
+ 				master->cluster[i]->is_new = 1;
+ 				master->cluster[i]->done = true;
++				master->cluster[i]->request = NULL;
+ 			}
+ 		}
+ 		ret = call_op(master, s_ctrl);
+@@ -2507,10 +2625,11 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ {
+ 	const unsigned next_flags = V4L2_CTRL_FLAG_NEXT_CTRL | V4L2_CTRL_FLAG_NEXT_COMPOUND;
+ 	u32 id = qc->id & V4L2_CTRL_ID_MASK;
++	u32 req = qc->request;
+ 	struct v4l2_ctrl_ref *ref;
+ 	struct v4l2_ctrl *ctrl;
+ 
+-	if (hdl == NULL)
++	if (hdl == NULL || req > USHRT_MAX)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(hdl->lock);
+@@ -2544,6 +2663,7 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 				is_compound = ref->ctrl->is_array ||
+ 					ref->ctrl->type >= V4L2_CTRL_COMPOUND_TYPES;
+ 				if (id < ref->ctrl->id &&
++				    (!req || get_request(ref->ctrl, req)) &&
+ 				    (is_compound & mask) == match)
+ 					break;
+ 			}
+@@ -2558,6 +2678,7 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 				is_compound = ref->ctrl->is_array ||
+ 					ref->ctrl->type >= V4L2_CTRL_COMPOUND_TYPES;
+ 				if (id < ref->ctrl->id &&
++				    (!req || get_request(ref->ctrl, req)) &&
+ 				    (is_compound & mask) == match)
+ 					break;
+ 			}
+@@ -2569,6 +2690,8 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 
+ 	if (!ref)
+ 		return -EINVAL;
++	if (req && get_request(ref->ctrl, req) == NULL)
++		return -EINVAL;
+ 
+ 	ctrl = ref->ctrl;
+ 	memset(qc, 0, sizeof(*qc));
+@@ -2578,6 +2701,7 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 		qc->id = ctrl->id;
+ 	strlcpy(qc->name, ctrl->name, sizeof(qc->name));
+ 	qc->flags = ctrl->flags;
++	qc->max_reqs = ctrl->max_reqs;
+ 	qc->type = ctrl->type;
+ 	if (ctrl->is_ptr)
+ 		qc->flags |= V4L2_CTRL_FLAG_HAS_PAYLOAD;
+@@ -2724,6 +2848,8 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 			     struct v4l2_ctrl_helper *helpers,
+ 			     bool get)
+ {
++	u32 which = V4L2_CTRL_ID2WHICH(cs->which);
++	unsigned request = cs->request & 0xffff;
+ 	struct v4l2_ctrl_helper *h;
+ 	bool have_clusters = false;
+ 	u32 i;
+@@ -2736,9 +2862,9 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 
+ 		cs->error_idx = i;
+ 
+-		if (cs->which &&
+-		    cs->which != V4L2_CTRL_WHICH_DEF_VAL &&
+-		    V4L2_CTRL_ID2WHICH(id) != cs->which)
++		if (which &&
++		    which != V4L2_CTRL_WHICH_DEF_VAL &&
++		    V4L2_CTRL_ID2WHICH(id) != which)
+ 			return -EINVAL;
+ 
+ 		/* Old-style private controls are not allowed for
+@@ -2751,6 +2877,8 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 		ctrl = ref->ctrl;
+ 		if (ctrl->flags & V4L2_CTRL_FLAG_DISABLED)
+ 			return -EINVAL;
++		if (request && !ctrl->max_reqs)
++			return -EINVAL;
+ 
+ 		if (ctrl->cluster[0]->ncontrols > 1)
+ 			have_clusters = true;
+@@ -2822,13 +2950,12 @@ static int class_check(struct v4l2_ctrl_handler *hdl, u32 which)
+ 	return find_ref_lock(hdl, which | 1) ? 0 : -EINVAL;
+ }
+ 
+-
+-
+ /* Get extended controls. Allocates the helpers array if needed. */
+ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs)
+ {
+ 	struct v4l2_ctrl_helper helper[4];
+ 	struct v4l2_ctrl_helper *helpers = helper;
++	unsigned request = 0;
+ 	int ret;
+ 	int i, j;
+ 	bool def_value;
+@@ -2836,13 +2963,16 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 	def_value = (cs->which == V4L2_CTRL_WHICH_DEF_VAL);
+ 
+ 	cs->error_idx = cs->count;
+-	cs->which = V4L2_CTRL_ID2WHICH(cs->which);
++	if (V4L2_CTRL_ID2WHICH(cs->which))
++		cs->which = V4L2_CTRL_ID2WHICH(cs->which);
++	else
++		request = cs->request;
+ 
+-	if (hdl == NULL)
++	if (hdl == NULL || request > USHRT_MAX)
+ 		return -EINVAL;
+ 
+ 	if (cs->count == 0)
+-		return class_check(hdl, cs->which);
++		return class_check(hdl, V4L2_CTRL_ID2WHICH(cs->which));
+ 
+ 	if (cs->count > ARRAY_SIZE(helper)) {
+ 		helpers = kvmalloc_array(cs->count, sizeof(helper[0]),
+@@ -2874,14 +3004,27 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 		v4l2_ctrl_lock(master);
+ 
+ 		/* g_volatile_ctrl will update the new control values */
+-		if (!def_value &&
++		if (!def_value && request == 0 &&
+ 		    ((master->flags & V4L2_CTRL_FLAG_VOLATILE) ||
+-		    (master->has_volatiles && !is_cur_manual(master)))) {
++		     (master->has_volatiles && !is_cur_manual(master)))) {
+ 			for (j = 0; j < master->ncontrols; j++)
+ 				cur_to_new(master->cluster[j]);
+ 			ret = call_op(master, g_volatile_ctrl);
+ 			ctrl_to_user = new_to_user;
+ 		}
++		if (request) {
++			for (j = 0; !ret && j < master->ncontrols; j++) {
++				struct v4l2_ctrl *ctrl = master->cluster[j];
++
++				if (!ctrl)
++					continue;
++				ctrl->request = get_request(ctrl, request);
++				if (ctrl->request)
++					continue;
++				ret = add_request(ctrl, request, &ctrl->request);
++			}
++		}
++
+ 		/* If OK, then copy the current (for non-volatile controls)
+ 		   or the new (for volatile controls) control values to the
+ 		   caller */
+@@ -2889,7 +3032,11 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 			u32 idx = i;
+ 
+ 			do {
+-				ret = ctrl_to_user(cs->controls + idx,
++				if (request)
++					ret = request_to_user(cs->controls + idx,
++						   helpers[idx].ctrl);
++				else
++					ret = ctrl_to_user(cs->controls + idx,
+ 						   helpers[idx].ctrl);
+ 				idx = helpers[idx].next;
+ 			} while (!ret && idx);
+@@ -2972,12 +3119,11 @@ s64 v4l2_ctrl_g_ctrl_int64(struct v4l2_ctrl *ctrl)
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_g_ctrl_int64);
+ 
+-
+ /* Core function that calls try/s_ctrl and ensures that the new value is
+    copied to the current value on a set.
+    Must be called with ctrl->handler->lock held. */
+ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+-			      bool set, u32 ch_flags)
++			      u16 request, bool set, u32 ch_flags)
+ {
+ 	bool update_flag;
+ 	int ret;
+@@ -2989,10 +3135,20 @@ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+ 	   called. */
+ 	for (i = 0; i < master->ncontrols; i++) {
+ 		struct v4l2_ctrl *ctrl = master->cluster[i];
++		struct v4l2_ctrl_req *req = NULL;
+ 
+ 		if (ctrl == NULL)
+ 			continue;
+ 
++		if (request) {
++			req = get_request(ctrl, request);
++			if (!req) {
++				ret = add_request(ctrl, request, &req);
++				if (ret)
++					return ret;
++			}
++		}
++		ctrl->request = req;
+ 		if (!ctrl->is_new) {
+ 			cur_to_new(ctrl);
+ 			continue;
+@@ -3006,7 +3162,7 @@ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+ 	ret = call_op(master, try_ctrl);
+ 
+ 	/* Don't set if there is no change */
+-	if (ret || !set || !cluster_changed(master))
++	if (ret || !set || (!request && !cluster_changed(master)))
+ 		return ret;
+ 	ret = call_op(master, s_ctrl);
+ 	if (ret)
+@@ -3014,9 +3170,13 @@ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+ 
+ 	/* If OK, then make the new values permanent. */
+ 	update_flag = is_cur_manual(master) != is_new_manual(master);
+-	for (i = 0; i < master->ncontrols; i++)
+-		new_to_cur(fh, master->cluster[i], ch_flags |
+-			((update_flag && i > 0) ? V4L2_EVENT_CTRL_CH_FLAGS : 0));
++	for (i = 0; i < master->ncontrols; i++) {
++		if (request)
++			new_to_request(master->cluster[i]);
++		else
++			new_to_cur(fh, master->cluster[i], ch_flags |
++				((update_flag && i > 0) ? V4L2_EVENT_CTRL_CH_FLAGS : 0));
++	}
+ 	return 0;
+ }
+ 
+@@ -3067,8 +3227,12 @@ static void update_from_auto_cluster(struct v4l2_ctrl *master)
+ {
+ 	int i;
+ 
+-	for (i = 1; i < master->ncontrols; i++)
++	for (i = 1; i < master->ncontrols; i++) {
++		if (master->cluster[i] == NULL)
++			continue;
+ 		cur_to_new(master->cluster[i]);
++		master->cluster[i]->request = 0;
++	}
+ 	if (!call_op(master, g_volatile_ctrl))
+ 		for (i = 1; i < master->ncontrols; i++)
+ 			if (master->cluster[i])
+@@ -3082,6 +3246,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ {
+ 	struct v4l2_ctrl_helper helper[4];
+ 	struct v4l2_ctrl_helper *helpers = helper;
++	unsigned request = 0;
+ 	unsigned i, j;
+ 	int ret;
+ 
+@@ -3091,13 +3256,16 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 	if (cs->which == V4L2_CTRL_WHICH_DEF_VAL)
+ 		return -EINVAL;
+ 
+-	cs->which = V4L2_CTRL_ID2WHICH(cs->which);
++	if (V4L2_CTRL_ID2WHICH(cs->which))
++		cs->which = V4L2_CTRL_ID2WHICH(cs->which);
++	else
++		request = cs->request;
+ 
+-	if (hdl == NULL)
++	if (hdl == NULL || request > USHRT_MAX)
+ 		return -EINVAL;
+ 
+ 	if (cs->count == 0)
+-		return class_check(hdl, cs->which);
++		return class_check(hdl, V4L2_CTRL_ID2WHICH(cs->which));
+ 
+ 	if (cs->count > ARRAY_SIZE(helper)) {
+ 		helpers = kvmalloc_array(cs->count, sizeof(helper[0]),
+@@ -3132,7 +3300,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		   first since those will become the new manual values (which
+ 		   may be overwritten by explicit new values from this set
+ 		   of controls). */
+-		if (master->is_auto && master->has_volatiles &&
++		if (!request && master->is_auto && master->has_volatiles &&
+ 						!is_cur_manual(master)) {
+ 			/* Pick an initial non-manual value */
+ 			s32 new_auto_val = master->manual_mode_value + 1;
+@@ -3163,13 +3331,13 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		} while (!ret && idx);
+ 
+ 		if (!ret)
+-			ret = try_or_set_cluster(fh, master, set, 0);
++			ret = try_or_set_cluster(fh, master, request, set, 0);
+ 
+ 		/* Copy the new values back to userspace. */
+ 		if (!ret) {
+ 			idx = i;
+ 			do {
+-				ret = new_to_user(cs->controls + idx,
++				ret = request_to_user(cs->controls + idx,
+ 						helpers[idx].ctrl);
+ 				idx = helpers[idx].next;
+ 			} while (!ret && idx);
+@@ -3203,9 +3371,12 @@ static int set_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ 	int i;
+ 
+ 	/* Reset the 'is_new' flags of the cluster */
+-	for (i = 0; i < master->ncontrols; i++)
+-		if (master->cluster[i])
+-			master->cluster[i]->is_new = 0;
++	for (i = 0; i < master->ncontrols; i++) {
++		if (master->cluster[i] == NULL)
++			continue;
++		master->cluster[i]->is_new = 0;
++		master->cluster[i]->request = NULL;
++	}
+ 
+ 	ret = validate_new(ctrl, ctrl->p_new);
+ 	if (ret)
+@@ -3219,7 +3390,7 @@ static int set_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ 		update_from_auto_cluster(master);
+ 
+ 	ctrl->is_new = 1;
+-	return try_or_set_cluster(fh, master, true, ch_flags);
++	return try_or_set_cluster(fh, master, 0, true, ch_flags);
+ }
+ 
+ /* Helper function for VIDIOC_S_CTRL compatibility */
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 1e8962145983..34fc0d93afbc 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2007,6 +2007,8 @@ static int v4l_query_ext_ctrl(const struct v4l2_ioctl_ops *ops,
+ 		return v4l2_query_ext_ctrl(vfh->ctrl_handler, p);
+ 	if (vfd->ctrl_handler)
+ 		return v4l2_query_ext_ctrl(vfd->ctrl_handler, p);
++	if (p->request)
++		return -EINVAL;
+ 	if (ops->vidioc_query_ext_ctrl)
+ 		return ops->vidioc_query_ext_ctrl(file, fh, p);
+ 	return -ENOTTY;
+@@ -2107,6 +2109,8 @@ static int v4l_g_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		return v4l2_g_ext_ctrls(vfd->ctrl_handler, p);
+ 	if (ops->vidioc_g_ext_ctrls == NULL)
+ 		return -ENOTTY;
++	if (p->request)
++		return -EINVAL;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_g_ext_ctrls(file, fh, p) :
+ 					-EINVAL;
+ }
+@@ -2126,6 +2130,8 @@ static int v4l_s_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		return v4l2_s_ext_ctrls(NULL, vfd->ctrl_handler, p);
+ 	if (ops->vidioc_s_ext_ctrls == NULL)
+ 		return -ENOTTY;
++	if (p->request)
++		return -EINVAL;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_s_ext_ctrls(file, fh, p) :
+ 					-EINVAL;
+ }
+@@ -2145,6 +2151,8 @@ static int v4l_try_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		return v4l2_try_ext_ctrls(vfd->ctrl_handler, p);
+ 	if (ops->vidioc_try_ext_ctrls == NULL)
+ 		return -ENOTTY;
++	if (p->request)
++		return -EINVAL;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_try_ext_ctrls(file, fh, p) :
+ 					-EINVAL;
+ }
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index dacfe54057f8..818a3abecf6d 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -105,6 +105,12 @@ struct v4l2_ctrl_type_ops {
+  */
+ typedef void (*v4l2_ctrl_notify_fnc)(struct v4l2_ctrl *ctrl, void *priv);
+ 
++struct v4l2_ctrl_req {
++	struct list_head node;
++	u32 request;
++	union v4l2_ctrl_ptr ptr;
++};
++
+ /**
+  * struct v4l2_ctrl - The control structure.
+  *
+@@ -156,6 +162,9 @@ typedef void (*v4l2_ctrl_notify_fnc)(struct v4l2_ctrl *ctrl, void *priv);
+  * @elem_size:	The size in bytes of the control.
+  * @dims:	The size of each dimension.
+  * @nr_of_dims:The number of dimensions in @dims.
++ * @nr_of_requests: The number of allocated requests of this control.
++ * @max_reqs:	The maximum number of requests supported by this control.
++ * @request:	The request that the control op operates on.
+  * @menu_skip_mask: The control's skip mask for menu controls. This makes it
+  *		easy to skip menu items that are not valid. If bit X is set,
+  *		then menu item X is skipped. Of course, this only works for
+@@ -213,6 +222,9 @@ struct v4l2_ctrl {
+ 	u32 elem_size;
+ 	u32 dims[V4L2_CTRL_MAX_DIMS];
+ 	u32 nr_of_dims;
++	u16 nr_of_requests;
++	u16 max_reqs;
++	struct v4l2_ctrl_req *request;
+ 	union {
+ 		u64 step;
+ 		u64 menu_skip_mask;
+@@ -230,6 +242,7 @@ struct v4l2_ctrl {
+ 
+ 	union v4l2_ctrl_ptr p_new;
+ 	union v4l2_ctrl_ptr p_cur;
++	struct list_head *request_lists;
+ };
+ 
+ /**
+@@ -316,6 +329,7 @@ struct v4l2_ctrl_handler {
+  *		V4L2_CTRL_TYPE_INTEGER_MENU.
+  * @is_private: If set, then this control is private to its handler and it
+  *		will not be added to any other handlers.
++ * @max_reqs:	The maximum number of requests supported by this control.
+  */
+ struct v4l2_ctrl_config {
+ 	const struct v4l2_ctrl_ops *ops;
+@@ -334,6 +348,7 @@ struct v4l2_ctrl_config {
+ 	const char * const *qmenu;
+ 	const s64 *qmenu_int;
+ 	unsigned int is_private:1;
++	u16 max_reqs;
+ };
+ 
+ /**
+@@ -980,6 +995,11 @@ static inline int v4l2_ctrl_s_ctrl_string(struct v4l2_ctrl *ctrl, const char *s)
+ 	return rval;
+ }
+ 
++static inline void v4l2_ctrl_s_max_reqs(struct v4l2_ctrl *ctrl, u16 max_reqs)
++{
++	ctrl->max_reqs = max_reqs;
++}
++
+ /* Internal helper functions that deal with control events. */
+ extern const struct v4l2_subscribed_event_ops v4l2_ctrl_sub_ev_ops;
+ 
+-- 
+2.14.2
+
+From 9f67d2e15e0b95a2f1a0d0c12c76cea1426bc853 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 13 Apr 2015 15:06:19 +0200
+Subject: [PATCH 06/31] v4l2-ctrls: add function to apply a request.
+
+Drivers need to be able to select a specific request. Add a new function that can
+be used to apply a given request.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 112 +++++++++++++++++++++++++++++++++--
+ include/media/v4l2-ctrls.h           |   3 +
+ include/uapi/linux/videodev2.h       |   1 +
+ 3 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index e826c5bc0af8..b55f402ba61c 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -1731,8 +1731,10 @@ static void new_to_cur(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ /* Helper function: copy the new control value to the request */
+ static void new_to_request(struct v4l2_ctrl *ctrl)
+ {
+-	if (ctrl)
++	if (ctrl) {
+ 		ptr_to_ptr(ctrl, ctrl->p_new, ctrl->request->ptr);
++		ctrl->request->applied = 0;
++	}
+ }
+ 
+ /* Copy the current value to the new value */
+@@ -1743,6 +1745,17 @@ static void cur_to_new(struct v4l2_ctrl *ctrl)
+ 	ptr_to_ptr(ctrl, ctrl->p_cur, ctrl->p_new);
+ }
+ 
++static void request_to_new(struct v4l2_ctrl *ctrl)
++{
++	if (ctrl == NULL)
++		return;
++	if (ctrl->request)
++		ptr_to_ptr(ctrl, ctrl->request->ptr, ctrl->p_new);
++	else
++		ptr_to_ptr(ctrl, ctrl->p_cur, ctrl->p_new);
++	ctrl->is_new = true;
++}
++
+ /* Return non-zero if one or more of the controls in the cluster has a new
+    value that differs from the current value. */
+ static int cluster_changed(struct v4l2_ctrl *master)
+@@ -2627,6 +2640,7 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 	u32 id = qc->id & V4L2_CTRL_ID_MASK;
+ 	u32 req = qc->request;
+ 	struct v4l2_ctrl_ref *ref;
++	struct v4l2_ctrl_req *ctrl_req = NULL;
+ 	struct v4l2_ctrl *ctrl;
+ 
+ 	if (hdl == NULL || req > USHRT_MAX)
+@@ -2690,8 +2704,11 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 
+ 	if (!ref)
+ 		return -EINVAL;
+-	if (req && get_request(ref->ctrl, req) == NULL)
+-		return -EINVAL;
++	if (req) {
++		ctrl_req = get_request(ref->ctrl, req);
++		if (ctrl_req == NULL)
++			return -EINVAL;
++	}
+ 
+ 	ctrl = ref->ctrl;
+ 	memset(qc, 0, sizeof(*qc));
+@@ -2701,6 +2718,10 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 		qc->id = ctrl->id;
+ 	strlcpy(qc->name, ctrl->name, sizeof(qc->name));
+ 	qc->flags = ctrl->flags;
++	if (req) {
++		if (ctrl_req->applied)
++			qc->flags |= V4L2_CTRL_FLAG_REQ_APPLIED;
++	}
+ 	qc->max_reqs = ctrl->max_reqs;
+ 	qc->type = ctrl->type;
+ 	if (ctrl->is_ptr)
+@@ -2849,7 +2870,7 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 			     bool get)
+ {
+ 	u32 which = V4L2_CTRL_ID2WHICH(cs->which);
+-	unsigned request = cs->request & 0xffff;
++	unsigned request = cs->request & USHRT_MAX;
+ 	struct v4l2_ctrl_helper *h;
+ 	bool have_clusters = false;
+ 	u32 i;
+@@ -3231,7 +3252,7 @@ static void update_from_auto_cluster(struct v4l2_ctrl *master)
+ 		if (master->cluster[i] == NULL)
+ 			continue;
+ 		cur_to_new(master->cluster[i]);
+-		master->cluster[i]->request = 0;
++		master->cluster[i]->request = NULL;
+ 	}
+ 	if (!call_op(master, g_volatile_ctrl))
+ 		for (i = 1; i < master->ncontrols; i++)
+@@ -3375,7 +3396,6 @@ static int set_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ 		if (master->cluster[i] == NULL)
+ 			continue;
+ 		master->cluster[i]->is_new = 0;
+-		master->cluster[i]->request = NULL;
+ 	}
+ 
+ 	ret = validate_new(ctrl, ctrl->p_new);
+@@ -3461,6 +3481,86 @@ int __v4l2_ctrl_s_ctrl_string(struct v4l2_ctrl *ctrl, const char *s)
+ }
+ EXPORT_SYMBOL(__v4l2_ctrl_s_ctrl_string);
+ 
++int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
++{
++	struct v4l2_ctrl_ref *ref;
++	bool found_request = false;
++	int ret = 0;
++	unsigned i;
++
++	if (hdl == NULL)
++		return -EINVAL;
++	if (request == 0)
++		return 0;
++
++	mutex_lock(hdl->lock);
++
++	list_for_each_entry(ref, &hdl->ctrl_refs, node) {
++		struct v4l2_ctrl *master;
++		bool apply_request = false;
++
++		if (ref->ctrl->max_reqs == 0)
++			continue;
++		master = ref->ctrl->cluster[0];
++		if (ref->ctrl != master)
++			continue;
++		if (master->handler != hdl)
++			v4l2_ctrl_lock(master);
++		for (i = 0; !ret && i < master->ncontrols; i++) {
++			struct v4l2_ctrl *ctrl = master->cluster[i];
++
++			if (ctrl == NULL)
++				continue;
++			ctrl->is_new = 0;
++			ctrl->request = get_request(ctrl, request);
++			if (ctrl->request == NULL)
++				continue;
++			found_request = true;
++			if (!ctrl->request->applied) {
++				request_to_new(master->cluster[i]);
++				apply_request = true;
++				ctrl->request->applied = 1;
++			}
++		}
++		if (ret) {
++			if (master->handler != hdl)
++				v4l2_ctrl_unlock(master);
++			break;
++		}
++
++		/*
++		 * Skip if it is a request that has already been applied.
++		 */
++		if (!apply_request)
++			goto unlock;
++
++		/* For volatile autoclusters that are currently in auto mode
++		   we need to discover if it will be set to manual mode.
++		   If so, then we have to copy the current volatile values
++		   first since those will become the new manual values (which
++		   may be overwritten by explicit new values from this set
++		   of controls). */
++		if (master->is_auto && master->has_volatiles &&
++						!is_cur_manual(master)) {
++			s32 new_auto_val = *master->p_new.p_s32;
++
++			/* If the new value == the manual value, then copy
++			   the current volatile values. */
++			if (new_auto_val == master->manual_mode_value)
++				update_from_auto_cluster(master);
++		}
++
++		try_or_set_cluster(NULL, master, 0, true, 0);
++
++unlock:
++		if (master->handler != hdl)
++			v4l2_ctrl_unlock(master);
++	}
++	mutex_unlock(hdl->lock);
++	return ret ? ret : (found_request ? 0 : -EINVAL);
++}
++EXPORT_SYMBOL(v4l2_ctrl_apply_request);
++
+ void v4l2_ctrl_notify(struct v4l2_ctrl *ctrl, v4l2_ctrl_notify_fnc notify, void *priv)
+ {
+ 	if (ctrl == NULL)
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index 818a3abecf6d..6ad0df048f53 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -108,6 +108,7 @@ typedef void (*v4l2_ctrl_notify_fnc)(struct v4l2_ctrl *ctrl, void *priv);
+ struct v4l2_ctrl_req {
+ 	struct list_head node;
+ 	u32 request;
++	unsigned applied:1;
+ 	union v4l2_ctrl_ptr ptr;
+ };
+ 
+@@ -1000,6 +1001,8 @@ static inline void v4l2_ctrl_s_max_reqs(struct v4l2_ctrl *ctrl, u16 max_reqs)
+ 	ctrl->max_reqs = max_reqs;
+ }
+ 
++int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request);
++
+ /* Internal helper functions that deal with control events. */
+ extern const struct v4l2_subscribed_event_ops v4l2_ctrl_sub_ev_ops;
+ 
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 47a37b63f369..bb03ec7aff77 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1668,6 +1668,7 @@ struct v4l2_querymenu {
+ #define V4L2_CTRL_FLAG_HAS_PAYLOAD	0x0100
+ #define V4L2_CTRL_FLAG_EXECUTE_ON_WRITE	0x0200
+ #define V4L2_CTRL_FLAG_MODIFY_LAYOUT	0x0400
++#define V4L2_CTRL_FLAG_REQ_APPLIED	0x0800
+ 
+ /*  Query flags, to be ORed with the control ID */
+ #define V4L2_CTRL_FLAG_NEXT_CTRL	0x80000000
+-- 
+2.14.2
+
+From 577910d37ee50b7f47809337bd36d7302f6a0b14 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Thu, 9 Apr 2015 14:11:42 +0200
+Subject: [PATCH 07/31] v4l2-ctrls: implement delete request(s)
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 42 ++++++++++++++++++++++++++++++++++++
+ include/media/v4l2-ctrls.h           |  1 +
+ 2 files changed, 43 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index b55f402ba61c..fed1dfb2f7eb 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -3561,6 +3561,48 @@ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_apply_request);
+ 
++int v4l2_ctrl_delete_request(struct v4l2_ctrl_handler *hdl, unsigned request)
++{
++	struct v4l2_ctrl_ref *ref;
++	unsigned i;
++
++	if (hdl == NULL || request == 0)
++		return -EINVAL;
++
++	mutex_lock(hdl->lock);
++
++	list_for_each_entry(ref, &hdl->ctrl_refs, node) {
++		struct v4l2_ctrl *master;
++
++		if (ref->ctrl->max_reqs == 0)
++			continue;
++		master = ref->ctrl->cluster[0];
++		if (ref->ctrl != master)
++			continue;
++		if (master->handler != hdl)
++			v4l2_ctrl_lock(master);
++		for (i = 0; i < master->ncontrols; i++) {
++			struct v4l2_ctrl *ctrl = master->cluster[i];
++			struct v4l2_ctrl_req *req;
++
++			if (ctrl == NULL || ctrl->request_lists == NULL)
++				continue;
++
++			if (request == 0) {
++				free_requests(ctrl);
++				continue;
++			}
++			req = get_request(ctrl, request);
++			if (req)
++				del_request(ctrl, req);
++		}
++		if (master->handler != hdl)
++			v4l2_ctrl_unlock(master);
++	}
++	return 0;
++}
++EXPORT_SYMBOL(v4l2_ctrl_delete_request);
++
+ void v4l2_ctrl_notify(struct v4l2_ctrl *ctrl, v4l2_ctrl_notify_fnc notify, void *priv)
+ {
+ 	if (ctrl == NULL)
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index 6ad0df048f53..da5a18fe2e32 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -1002,6 +1002,7 @@ static inline void v4l2_ctrl_s_max_reqs(struct v4l2_ctrl *ctrl, u16 max_reqs)
+ }
+ 
+ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request);
++int v4l2_ctrl_delete_request(struct v4l2_ctrl_handler *hdl, unsigned request);
+ 
+ /* Internal helper functions that deal with control events. */
+ extern const struct v4l2_subscribed_event_ops v4l2_ctrl_sub_ev_ops;
+-- 
+2.14.2
+
+From 04e3d4dc96f0bb9865c13d39db7d4a59d966ed59 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Thu, 9 Apr 2015 14:28:32 +0200
+Subject: [PATCH 08/31] v4l2-ctrls: add VIDIOC_REQUEST_CMD
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c  | 54 ++++++++++++++---------
+ drivers/media/v4l2-core/v4l2-dev.c    |  1 +
+ drivers/media/v4l2-core/v4l2-ioctl.c  | 81 ++++++++++++++++++++++++++++++-----
+ drivers/media/v4l2-core/v4l2-subdev.c | 63 ++++++++++++++++++++++++---
+ include/media/v4l2-ctrls.h            |  8 ++--
+ include/media/v4l2-fh.h               |  1 +
+ include/uapi/linux/videodev2.h        | 17 ++++++++
+ 7 files changed, 185 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index fed1dfb2f7eb..91db97f16133 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -2743,9 +2743,13 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ EXPORT_SYMBOL(v4l2_query_ext_ctrl);
+ 
+ /* Implement VIDIOC_QUERYCTRL */
+-int v4l2_queryctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_queryctrl *qc)
++int v4l2_queryctrl(struct v4l2_ctrl_handler *hdl,
++		   unsigned request, struct v4l2_queryctrl *qc)
+ {
+-	struct v4l2_query_ext_ctrl qec = { qc->id };
++	struct v4l2_query_ext_ctrl qec = {
++		.id = qc->id,
++		.request = request,
++	};
+ 	int rc;
+ 
+ 	rc = v4l2_query_ext_ctrl(hdl, &qec);
+@@ -3072,7 +3076,8 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ EXPORT_SYMBOL(v4l2_g_ext_ctrls);
+ 
+ /* Helper function to get a single control */
+-static int get_ctrl(struct v4l2_ctrl *ctrl, struct v4l2_ext_control *c)
++static int get_ctrl(struct v4l2_ctrl *ctrl,
++		    unsigned request, struct v4l2_ext_control *c)
+ {
+ 	struct v4l2_ctrl *master = ctrl->cluster[0];
+ 	int ret = 0;
+@@ -3090,11 +3095,17 @@ static int get_ctrl(struct v4l2_ctrl *ctrl, struct v4l2_ext_control *c)
+ 
+ 	v4l2_ctrl_lock(master);
+ 	/* g_volatile_ctrl will update the current control values */
+-	if (ctrl->flags & V4L2_CTRL_FLAG_VOLATILE) {
++	if (request == 0 && (ctrl->flags & V4L2_CTRL_FLAG_VOLATILE)) {
+ 		for (i = 0; i < master->ncontrols; i++)
+ 			cur_to_new(master->cluster[i]);
+ 		ret = call_op(master, g_volatile_ctrl);
+ 		new_to_user(c, ctrl);
++	} else if (request) {
++		ctrl->request = get_request(ctrl, request);
++		if (ctrl->request)
++			ptr_to_user(c, ctrl, ctrl->request->ptr);
++		else
++			ret = -EINVAL;
+ 	} else {
+ 		cur_to_user(c, ctrl);
+ 	}
+@@ -3102,7 +3113,8 @@ static int get_ctrl(struct v4l2_ctrl *ctrl, struct v4l2_ext_control *c)
+ 	return ret;
+ }
+ 
+-int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_control *control)
++int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl,
++		unsigned request, struct v4l2_control *control)
+ {
+ 	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(hdl, control->id);
+ 	struct v4l2_ext_control c;
+@@ -3110,7 +3122,7 @@ int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_control *control)
+ 
+ 	if (ctrl == NULL || !ctrl->is_int)
+ 		return -EINVAL;
+-	ret = get_ctrl(ctrl, &c);
++	ret = get_ctrl(ctrl, request, &c);
+ 	control->value = c.value;
+ 	return ret;
+ }
+@@ -3123,7 +3135,7 @@ s32 v4l2_ctrl_g_ctrl(struct v4l2_ctrl *ctrl)
+ 	/* It's a driver bug if this happens. */
+ 	WARN_ON(!ctrl->is_int);
+ 	c.value = 0;
+-	get_ctrl(ctrl, &c);
++	get_ctrl(ctrl, 0, &c);
+ 	return c.value;
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_g_ctrl);
+@@ -3135,7 +3147,7 @@ s64 v4l2_ctrl_g_ctrl_int64(struct v4l2_ctrl *ctrl)
+ 	/* It's a driver bug if this happens. */
+ 	WARN_ON(ctrl->is_ptr || ctrl->type != V4L2_CTRL_TYPE_INTEGER64);
+ 	c.value64 = 0;
+-	get_ctrl(ctrl, &c);
++	get_ctrl(ctrl, 0, &c);
+ 	return c.value64;
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_g_ctrl_int64);
+@@ -3385,7 +3397,8 @@ int v4l2_s_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ EXPORT_SYMBOL(v4l2_s_ext_ctrls);
+ 
+ /* Helper function for VIDIOC_S_CTRL compatibility */
+-static int set_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
++static int set_ctrl(struct v4l2_fh *fh, unsigned request,
++		    struct v4l2_ctrl *ctrl, u32 ch_flags)
+ {
+ 	struct v4l2_ctrl *master = ctrl->cluster[0];
+ 	int ret;
+@@ -3405,23 +3418,24 @@ static int set_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl, u32 ch_flags)
+ 	/* For autoclusters with volatiles that are switched from auto to
+ 	   manual mode we have to update the current volatile values since
+ 	   those will become the initial manual values after such a switch. */
+-	if (master->is_auto && master->has_volatiles && ctrl == master &&
++	if (request == 0 &&
++	    master->is_auto && master->has_volatiles && ctrl == master &&
+ 	    !is_cur_manual(master) && ctrl->val == master->manual_mode_value)
+ 		update_from_auto_cluster(master);
+ 
+ 	ctrl->is_new = 1;
+-	return try_or_set_cluster(fh, master, 0, true, ch_flags);
++	return try_or_set_cluster(fh, master, request, true, ch_flags);
+ }
+ 
+ /* Helper function for VIDIOC_S_CTRL compatibility */
+-static int set_ctrl_lock(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl,
+-			 struct v4l2_ext_control *c)
++static int set_ctrl_lock(struct v4l2_fh *fh, unsigned request,
++			 struct v4l2_ctrl *ctrl, struct v4l2_ext_control *c)
+ {
+ 	int ret;
+ 
+ 	v4l2_ctrl_lock(ctrl);
+ 	user_to_new(c, ctrl);
+-	ret = set_ctrl(fh, ctrl, 0);
++	ret = set_ctrl(fh, request, ctrl, 0);
+ 	if (!ret)
+ 		cur_to_user(c, ctrl);
+ 	v4l2_ctrl_unlock(ctrl);
+@@ -3429,7 +3443,7 @@ static int set_ctrl_lock(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl,
+ }
+ 
+ int v4l2_s_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+-					struct v4l2_control *control)
++		unsigned request, struct v4l2_control *control)
+ {
+ 	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(hdl, control->id);
+ 	struct v4l2_ext_control c = { control->id };
+@@ -3442,7 +3456,7 @@ int v4l2_s_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		return -EACCES;
+ 
+ 	c.value = control->value;
+-	ret = set_ctrl_lock(fh, ctrl, &c);
++	ret = set_ctrl_lock(fh, request, ctrl, &c);
+ 	control->value = c.value;
+ 	return ret;
+ }
+@@ -3455,7 +3469,7 @@ int __v4l2_ctrl_s_ctrl(struct v4l2_ctrl *ctrl, s32 val)
+ 	/* It's a driver bug if this happens. */
+ 	WARN_ON(!ctrl->is_int);
+ 	ctrl->val = val;
+-	return set_ctrl(NULL, ctrl, 0);
++	return set_ctrl(NULL, 0, ctrl, 0);
+ }
+ EXPORT_SYMBOL(__v4l2_ctrl_s_ctrl);
+ 
+@@ -3466,7 +3480,7 @@ int __v4l2_ctrl_s_ctrl_int64(struct v4l2_ctrl *ctrl, s64 val)
+ 	/* It's a driver bug if this happens. */
+ 	WARN_ON(ctrl->is_ptr || ctrl->type != V4L2_CTRL_TYPE_INTEGER64);
+ 	*ctrl->p_new.p_s64 = val;
+-	return set_ctrl(NULL, ctrl, 0);
++	return set_ctrl(NULL, 0, ctrl, 0);
+ }
+ EXPORT_SYMBOL(__v4l2_ctrl_s_ctrl_int64);
+ 
+@@ -3477,7 +3491,7 @@ int __v4l2_ctrl_s_ctrl_string(struct v4l2_ctrl *ctrl, const char *s)
+ 	/* It's a driver bug if this happens. */
+ 	WARN_ON(ctrl->type != V4L2_CTRL_TYPE_STRING);
+ 	strlcpy(ctrl->p_new.p_char, s, ctrl->maximum + 1);
+-	return set_ctrl(NULL, ctrl, 0);
++	return set_ctrl(NULL, 0, ctrl, 0);
+ }
+ EXPORT_SYMBOL(__v4l2_ctrl_s_ctrl_string);
+ 
+@@ -3668,7 +3682,7 @@ int __v4l2_ctrl_modify_range(struct v4l2_ctrl *ctrl,
+ 	else
+ 		value_changed = *ctrl->p_new.p_s32 != *ctrl->p_cur.p_s32;
+ 	if (value_changed)
+-		ret = set_ctrl(NULL, ctrl, V4L2_EVENT_CTRL_CH_RANGE);
++		ret = set_ctrl(NULL, 0, ctrl, V4L2_EVENT_CTRL_CH_RANGE);
+ 	else if (range_changed)
+ 		send_event(NULL, ctrl, V4L2_EVENT_CTRL_CH_RANGE);
+ 	return ret;
+diff --git a/drivers/media/v4l2-core/v4l2-dev.c b/drivers/media/v4l2-core/v4l2-dev.c
+index c647ba648805..623ed06d874e 100644
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -562,6 +562,7 @@ static void determine_valid_ioctls(struct video_device *vdev)
+ 	SET_VALID_IOCTL(ops, VIDIOC_G_FREQUENCY, vidioc_g_frequency);
+ 	SET_VALID_IOCTL(ops, VIDIOC_S_FREQUENCY, vidioc_s_frequency);
+ 	SET_VALID_IOCTL(ops, VIDIOC_LOG_STATUS, vidioc_log_status);
++	set_bit(_IOC_NR(VIDIOC_REQUEST_CMD), valid_ioctls);
+ #ifdef CONFIG_VIDEO_ADV_DEBUG
+ 	set_bit(_IOC_NR(VIDIOC_DBG_G_CHIP_INFO), valid_ioctls);
+ 	set_bit(_IOC_NR(VIDIOC_DBG_G_REGISTER), valid_ioctls);
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 34fc0d93afbc..aafebced0c56 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -641,6 +641,14 @@ static void v4l_print_decoder_cmd(const void *arg, bool write_only)
+ 		pr_info("pts=%llu\n", p->stop.pts);
+ }
+ 
++static void v4l_print_request_cmd(const void *arg, bool write_only)
++{
++	const struct v4l2_request_cmd *p = arg;
++
++	pr_cont("cmd=%u, request=%u, flags=0x%x\n",
++			p->cmd, p->request, p->flags);
++}
++
+ static void v4l_print_dbg_chip_info(const void *arg, bool write_only)
+ {
+ 	const struct v4l2_dbg_chip_info *p = arg;
+@@ -1987,9 +1995,9 @@ static int v4l_queryctrl(const struct v4l2_ioctl_ops *ops,
+ 		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_queryctrl(vfh->ctrl_handler, p);
++		return v4l2_queryctrl(vfh->ctrl_handler, vfh->request, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_queryctrl(vfd->ctrl_handler, p);
++		return v4l2_queryctrl(vfd->ctrl_handler, 0, p);
+ 	if (ops->vidioc_queryctrl)
+ 		return ops->vidioc_queryctrl(file, fh, p);
+ 	return -ENOTTY;
+@@ -2003,8 +2011,11 @@ static int v4l_query_ext_ctrl(const struct v4l2_ioctl_ops *ops,
+ 	struct v4l2_fh *vfh =
+ 		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+ 
+-	if (vfh && vfh->ctrl_handler)
++	if (vfh && vfh->ctrl_handler) {
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_query_ext_ctrl(vfh->ctrl_handler, p);
++	}
+ 	if (vfd->ctrl_handler)
+ 		return v4l2_query_ext_ctrl(vfd->ctrl_handler, p);
+ 	if (p->request)
+@@ -2042,9 +2053,9 @@ static int v4l_g_ctrl(const struct v4l2_ioctl_ops *ops,
+ 	struct v4l2_ext_control ctrl;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_g_ctrl(vfh->ctrl_handler, p);
++		return v4l2_g_ctrl(vfh->ctrl_handler, vfh->request, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_g_ctrl(vfd->ctrl_handler, p);
++		return v4l2_g_ctrl(vfd->ctrl_handler, 0, p);
+ 	if (ops->vidioc_g_ctrl)
+ 		return ops->vidioc_g_ctrl(file, fh, p);
+ 	if (ops->vidioc_g_ext_ctrls == NULL)
+@@ -2076,9 +2087,9 @@ static int v4l_s_ctrl(const struct v4l2_ioctl_ops *ops,
+ 	struct v4l2_ext_control ctrl;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_s_ctrl(vfh, vfh->ctrl_handler, p);
++		return v4l2_s_ctrl(vfh, vfh->ctrl_handler, vfh->request, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_s_ctrl(NULL, vfd->ctrl_handler, p);
++		return v4l2_s_ctrl(NULL, vfd->ctrl_handler, 0, p);
+ 	if (ops->vidioc_s_ctrl)
+ 		return ops->vidioc_s_ctrl(file, fh, p);
+ 	if (ops->vidioc_s_ext_ctrls == NULL)
+@@ -2103,8 +2114,11 @@ static int v4l_g_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+ 
+ 	p->error_idx = p->count;
+-	if (vfh && vfh->ctrl_handler)
++	if (vfh && vfh->ctrl_handler) {
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_g_ext_ctrls(vfh->ctrl_handler, p);
++	}
+ 	if (vfd->ctrl_handler)
+ 		return v4l2_g_ext_ctrls(vfd->ctrl_handler, p);
+ 	if (ops->vidioc_g_ext_ctrls == NULL)
+@@ -2124,8 +2138,11 @@ static int v4l_s_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+ 
+ 	p->error_idx = p->count;
+-	if (vfh && vfh->ctrl_handler)
++	if (vfh && vfh->ctrl_handler) {
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, p);
++	}
+ 	if (vfd->ctrl_handler)
+ 		return v4l2_s_ext_ctrls(NULL, vfd->ctrl_handler, p);
+ 	if (ops->vidioc_s_ext_ctrls == NULL)
+@@ -2145,8 +2162,11 @@ static int v4l_try_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+ 
+ 	p->error_idx = p->count;
+-	if (vfh && vfh->ctrl_handler)
++	if (vfh && vfh->ctrl_handler) {
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_try_ext_ctrls(vfh->ctrl_handler, p);
++	}
+ 	if (vfd->ctrl_handler)
+ 		return v4l2_try_ext_ctrls(vfd->ctrl_handler, p);
+ 	if (ops->vidioc_try_ext_ctrls == NULL)
+@@ -2305,6 +2325,46 @@ static int v4l_cropcap(const struct v4l2_ioctl_ops *ops,
+ 	return 0;
+ }
+ 
++static int v4l_request_cmd(const struct v4l2_ioctl_ops *ops,
++				struct file *file, void *fh, void *arg)
++{
++	struct v4l2_request_cmd *p = arg;
++	struct video_device *vfd;
++	struct v4l2_fh *vfh;
++	int ret;
++
++	vfd = video_devdata(file);
++	if (!test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
++		return -ENOTTY;
++	vfh = file->private_data;
++	if (vfh->ctrl_handler == NULL)
++		return -ENOTTY;
++	ret = v4l2_prio_check(vfd->prio, vfh->prio);
++	if (ret)
++		return ret;
++	if (p->request > USHRT_MAX)
++		return -EINVAL;
++	switch (p->cmd) {
++	case V4L2_REQ_CMD_BEGIN:
++		if (vfh->request)
++			return -EBUSY;
++		if (p->request == 0)
++			return -EINVAL;
++		vfh->request = p->request;
++		break;
++	case V4L2_REQ_CMD_END:
++		vfh->request = 0;
++		break;
++	case V4L2_REQ_CMD_DELETE:
++		return v4l2_ctrl_delete_request(vfh->ctrl_handler, p->request);
++	case V4L2_REQ_CMD_APPLY:
++		return v4l2_ctrl_apply_request(vfh->ctrl_handler, p->request);
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ static int v4l_log_status(const struct v4l2_ioctl_ops *ops,
+ 				struct file *file, void *fh, void *arg)
+ {
+@@ -2647,6 +2707,7 @@ static struct v4l2_ioctl_info v4l2_ioctls[] = {
+ 	IOCTL_INFO_FNC(VIDIOC_ENUM_FREQ_BANDS, v4l_enum_freq_bands, v4l_print_freq_band, 0),
+ 	IOCTL_INFO_FNC(VIDIOC_DBG_G_CHIP_INFO, v4l_dbg_g_chip_info, v4l_print_dbg_chip_info, INFO_FL_CLEAR(v4l2_dbg_chip_info, match)),
+ 	IOCTL_INFO_FNC(VIDIOC_QUERY_EXT_CTRL, v4l_query_ext_ctrl, v4l_print_query_ext_ctrl, INFO_FL_CTRL | INFO_FL_CLEAR(v4l2_query_ext_ctrl, id)),
++	IOCTL_INFO_FNC(VIDIOC_REQUEST_CMD, v4l_request_cmd, v4l_print_request_cmd, 0),
+ };
+ #define V4L2_IOCTLS ARRAY_SIZE(v4l2_ioctls)
+ 
+diff --git a/drivers/media/v4l2-core/v4l2-subdev.c b/drivers/media/v4l2-core/v4l2-subdev.c
+index 43fefa73e0a3..0b5997ebadce 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev.c
++++ b/drivers/media/v4l2-core/v4l2-subdev.c
+@@ -187,28 +187,48 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 
+ 	switch (cmd) {
+ 	case VIDIOC_QUERYCTRL:
+-		return v4l2_queryctrl(vfh->ctrl_handler, arg);
++		return v4l2_queryctrl(vfh->ctrl_handler, vfh->request, arg);
+ 
+-	case VIDIOC_QUERY_EXT_CTRL:
++	case VIDIOC_QUERY_EXT_CTRL: {
++		struct v4l2_query_ext_ctrl *p = arg;
++
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_query_ext_ctrl(vfh->ctrl_handler, arg);
++	}
+ 
+ 	case VIDIOC_QUERYMENU:
+ 		return v4l2_querymenu(vfh->ctrl_handler, arg);
+ 
+ 	case VIDIOC_G_CTRL:
+-		return v4l2_g_ctrl(vfh->ctrl_handler, arg);
++		return v4l2_g_ctrl(vfh->ctrl_handler, vfh->request, arg);
+ 
+ 	case VIDIOC_S_CTRL:
+-		return v4l2_s_ctrl(vfh, vfh->ctrl_handler, arg);
++		return v4l2_s_ctrl(vfh, vfh->ctrl_handler, vfh->request, arg);
+ 
+-	case VIDIOC_G_EXT_CTRLS:
++	case VIDIOC_G_EXT_CTRLS: {
++		struct v4l2_ext_controls *p = arg;
++
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_g_ext_ctrls(vfh->ctrl_handler, arg);
++	}
+ 
+-	case VIDIOC_S_EXT_CTRLS:
++	case VIDIOC_S_EXT_CTRLS: {
++		struct v4l2_ext_controls *p = arg;
++
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, arg);
++	}
+ 
+-	case VIDIOC_TRY_EXT_CTRLS:
++	case VIDIOC_TRY_EXT_CTRLS: {
++		struct v4l2_ext_controls *p = arg;
++
++		if (vfh->request && p->request == 0)
++			p->request = vfh->request;
+ 		return v4l2_try_ext_ctrls(vfh->ctrl_handler, arg);
++	}
+ 
+ 	case VIDIOC_DQEVENT:
+ 		if (!(sd->flags & V4L2_SUBDEV_FL_HAS_EVENTS))
+@@ -222,6 +242,35 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 	case VIDIOC_UNSUBSCRIBE_EVENT:
+ 		return v4l2_subdev_call(sd, core, unsubscribe_event, vfh, arg);
+ 
++	case VIDIOC_REQUEST_CMD: {
++		struct v4l2_request_cmd *p = arg;
++
++		if (p->request > USHRT_MAX)
++			return -EINVAL;
++
++		switch (p->cmd) {
++		case V4L2_REQ_CMD_BEGIN:
++			if (vfh->request)
++				return -EBUSY;
++			if (p->request == 0)
++				return -EINVAL;
++			vfh->request = p->request;
++			break;
++		case V4L2_REQ_CMD_END:
++			vfh->request = 0;
++			break;
++		case V4L2_REQ_CMD_DELETE:
++			return v4l2_ctrl_delete_request(vfh->ctrl_handler,
++							p->request);
++		case V4L2_REQ_CMD_APPLY:
++			return v4l2_ctrl_apply_request(vfh->ctrl_handler,
++						       p->request);
++		default:
++			return -EINVAL;
++		}
++		return 0;
++	}
++
+ #ifdef CONFIG_VIDEO_ADV_DEBUG
+ 	case VIDIOC_DBG_G_REGISTER:
+ 	{
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index da5a18fe2e32..e90433eb6b19 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -1074,7 +1074,8 @@ unsigned int v4l2_ctrl_poll(struct file *file, struct poll_table_struct *wait);
+  *
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+-int v4l2_queryctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_queryctrl *qc);
++int v4l2_queryctrl(struct v4l2_ctrl_handler *hdl,
++		   unsigned request, struct v4l2_queryctrl *qc);
+ 
+ /**
+  * v4l2_query_ext_ctrl - Helper function to implement
+@@ -1108,7 +1109,8 @@ int v4l2_querymenu(struct v4l2_ctrl_handler *hdl, struct v4l2_querymenu *qm);
+  *
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+-int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_control *ctrl);
++int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl,
++		unsigned request, struct v4l2_control *ctrl);
+ 
+ /**
+  * v4l2_s_ctrl - Helper function to implement
+@@ -1122,7 +1124,7 @@ int v4l2_g_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_control *ctrl);
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+ int v4l2_s_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+-		struct v4l2_control *ctrl);
++		unsigned request, struct v4l2_control *ctrl);
+ 
+ /**
+  * v4l2_g_ext_ctrls - Helper function to implement
+diff --git a/include/media/v4l2-fh.h b/include/media/v4l2-fh.h
+index 62633e7d2630..25aef57180bb 100644
+--- a/include/media/v4l2-fh.h
++++ b/include/media/v4l2-fh.h
+@@ -55,6 +55,7 @@ struct v4l2_fh {
+ 	struct list_head	available;
+ 	unsigned int		navailable;
+ 	u32			sequence;
++	u16			request;
+ 
+ #if IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
+ 	struct v4l2_m2m_ctx	*m2m_ctx;
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index bb03ec7aff77..df0687fa5e0f 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -2297,6 +2297,21 @@ struct v4l2_create_buffers {
+ 	__u32			reserved[8];
+ };
+ 
++#define V4L2_REQ_CMD_BEGIN	(0)
++#define V4L2_REQ_CMD_END	(1)
++#define V4L2_REQ_CMD_DELETE	(2)
++#define V4L2_REQ_CMD_APPLY	(3)
++
++struct v4l2_request_cmd {
++	__u32 cmd;
++	__u16 request;
++	__u16 flags;
++	union {
++		struct {
++			__u32 data[8];
++		} raw;
++	};
++};
+ /*
+  *	I O C T L   C O D E S   F O R   V I D E O   D E V I C E S
+  *
+@@ -2398,6 +2413,8 @@ struct v4l2_create_buffers {
+ 
+ #define VIDIOC_QUERY_EXT_CTRL	_IOWR('V', 103, struct v4l2_query_ext_ctrl)
+ 
++#define VIDIOC_REQUEST_CMD      _IOWR('V', 104, struct v4l2_request_cmd)
++
+ /* Reminder: when adding new ioctls please add support for them to
+    drivers/media/v4l2-core/v4l2-compat-ioctl32.c as well! */
+ 
+-- 
+2.14.2
+
+From ad3d54e460748ce7d3bbd376cbe1c01d5c20b0d5 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 12:28:44 +0200
+Subject: [PATCH 09/31] v4l2: add initial V4L2_REQ_CMD_QUEUE support
+
+Add the V4L2_REQ_CMD_QUEUE command and the req_queue callback to struct
+v4l2_device. Call it if set from v4l2-ioctl.c and v4l2-subdev.c. Make sure
+in v4l2-ioctl.c to unlock any current lock first (and relock afterwards).
+That way req_queue is called with the assurance that there are no video_device
+locks taken. Since req_queue operates device-wide that would make that code
+much more complex.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ioctl.c  | 11 +++++++++++
+ drivers/media/v4l2-core/v4l2-subdev.c |  6 ++++++
+ include/media/v4l2-device.h           |  2 ++
+ include/uapi/linux/videodev2.h        |  1 +
+ 4 files changed, 20 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index aafebced0c56..6f7f6a88942c 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2359,6 +2359,17 @@ static int v4l_request_cmd(const struct v4l2_ioctl_ops *ops,
+ 		return v4l2_ctrl_delete_request(vfh->ctrl_handler, p->request);
+ 	case V4L2_REQ_CMD_APPLY:
+ 		return v4l2_ctrl_apply_request(vfh->ctrl_handler, p->request);
++	case V4L2_REQ_CMD_QUEUE:
++		if (vfd->v4l2_dev->req_queue == NULL)
++			return -ENOSYS;
++		if (p->request == 0)
++			return -EINVAL;
++		if (vfd->lock)
++			mutex_unlock(vfd->lock);
++		ret = vfd->v4l2_dev->req_queue(vfd->v4l2_dev, p->request);
++		if (vfd->lock)
++			mutex_lock(vfd->lock);
++		return ret;
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/media/v4l2-core/v4l2-subdev.c b/drivers/media/v4l2-core/v4l2-subdev.c
+index 0b5997ebadce..c1da78c7ff6c 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev.c
++++ b/drivers/media/v4l2-core/v4l2-subdev.c
+@@ -265,6 +265,12 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 		case V4L2_REQ_CMD_APPLY:
+ 			return v4l2_ctrl_apply_request(vfh->ctrl_handler,
+ 						       p->request);
++		case V4L2_REQ_CMD_QUEUE:
++			if (sd->v4l2_dev->req_queue == NULL)
++				return -ENOSYS;
++			if (p->request == 0)
++				return -EINVAL;
++			return sd->v4l2_dev->req_queue(sd->v4l2_dev, p->request);
+ 		default:
+ 			return -EINVAL;
+ 		}
+diff --git a/include/media/v4l2-device.h b/include/media/v4l2-device.h
+index 8ffa94009d1a..f11f079b2fa4 100644
+--- a/include/media/v4l2-device.h
++++ b/include/media/v4l2-device.h
+@@ -71,6 +71,8 @@ struct v4l2_device {
+ 	struct v4l2_prio_state prio;
+ 	struct kref ref;
+ 	void (*release)(struct v4l2_device *v4l2_dev);
++	/* Queue a request */
++	int (*req_queue)(struct v4l2_device *v4l2_dev, u16 request);
+ };
+ 
+ /**
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index df0687fa5e0f..63cebaec01da 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -2301,6 +2301,7 @@ struct v4l2_create_buffers {
+ #define V4L2_REQ_CMD_END	(1)
+ #define V4L2_REQ_CMD_DELETE	(2)
+ #define V4L2_REQ_CMD_APPLY	(3)
++#define V4L2_REQ_CMD_QUEUE	(4)
+ 
+ struct v4l2_request_cmd {
+ 	__u32 cmd;
+-- 
+2.14.2
+
+From ca0ae5259835d2b01f89ea36c2970159111857e8 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 13 Apr 2015 15:53:34 +0200
+Subject: [PATCH 10/31] vb2: add helper function to queue request-specific
+ buffer.
+
+The vb2_qbuf_request() function will queue any buffers for the given request
+that are in state PREPARED.
+
+Useful when drivers have to implement the req_queue callback.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/videobuf2-v4l2.c | 42 ++++++++++++++++++++++++++++++++
+ include/media/videobuf2-v4l2.h           |  1 +
+ 2 files changed, 43 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/videobuf2-v4l2.c b/drivers/media/v4l2-core/videobuf2-v4l2.c
+index d7676f5e9e31..4469face8d32 100644
+--- a/drivers/media/v4l2-core/videobuf2-v4l2.c
++++ b/drivers/media/v4l2-core/videobuf2-v4l2.c
+@@ -580,6 +580,48 @@ int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b)
+ }
+ EXPORT_SYMBOL_GPL(vb2_qbuf);
+ 
++int vb2_qbuf_request(struct vb2_queue *q, u16 request, struct vb2_buffer **p_buf)
++{
++	struct v4l2_buffer v4l2_buf;
++	int buffer;
++
++	for (buffer = 0; buffer < q->num_buffers; buffer++) {
++		struct vb2_buffer *vb = q->bufs[buffer];
++		struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++		if (vbuf->request == request &&
++		    vb->state == VB2_BUF_STATE_PREPARED) {
++			if (p_buf)
++				*p_buf = vb;
++			__fill_v4l2_buffer(vb, &v4l2_buf);
++			return vb2_qbuf(q, &v4l2_buf);
++		}
++	}
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(vb2_qbuf_request);
++
++/**
++ * vb2_dqbuf() - Dequeue a buffer to the userspace
++ * @q:		videobuf2 queue
++ * @b:		buffer structure passed from userspace to vidioc_dqbuf handler
++ *		in driver
++ * @nonblocking: if true, this call will not sleep waiting for a buffer if no
++ *		 buffers ready for dequeuing are present. Normally the driver
++ *		 would be passing (file->f_flags & O_NONBLOCK) here
++ *
++ * Should be called from vidioc_dqbuf ioctl handler of a driver.
++ * This function:
++ * 1) verifies the passed buffer,
++ * 2) calls buf_finish callback in the driver (if provided), in which
++ *    driver can perform any additional operations that may be required before
++ *    returning the buffer to userspace, such as cache sync,
++ * 3) the buffer struct members are filled with relevant information for
++ *    the userspace.
++ *
++ * The return values from this function are intended to be directly returned
++ * from vidioc_dqbuf handler in driver.
++ */
+ int vb2_dqbuf(struct vb2_queue *q, struct v4l2_buffer *b, bool nonblocking)
+ {
+ 	int ret;
+diff --git a/include/media/videobuf2-v4l2.h b/include/media/videobuf2-v4l2.h
+index 3029b763ab58..47d38971b9d5 100644
+--- a/include/media/videobuf2-v4l2.h
++++ b/include/media/videobuf2-v4l2.h
+@@ -113,6 +113,7 @@ int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b);
+  * from VIDIOC_QBUF() handler in driver.
+  */
+ int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b);
++int vb2_qbuf_request(struct vb2_queue *q, u16 request, struct vb2_buffer **p_buf);
+ 
+ /**
+  * vb2_expbuf() - Export a buffer as a file descriptor
+-- 
+2.14.2
+
+From 41e6ecde1a33fc42bd1007b7763f721074b6c4db Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 09:58:34 +0200
+Subject: [PATCH 11/31] v4l2-device: keep track of registered video_devices
+
+In order to efficiently handle V4L2_REQ_CMD_QUEUE we need to know which
+video_device structs are registered for the given v4l2_device struct.
+
+So create a list of vdevs in v4l2_device and add/remove each video_device
+there as it is registered/unregistered.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-dev.c    | 8 ++++++++
+ drivers/media/v4l2-core/v4l2-device.c | 1 +
+ include/media/v4l2-dev.h              | 3 +++
+ include/media/v4l2-device.h           | 2 ++
+ 4 files changed, 14 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-dev.c b/drivers/media/v4l2-core/v4l2-dev.c
+index 623ed06d874e..b9a41292229d 100644
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -842,6 +842,8 @@ int __video_register_device(struct video_device *vdev, int type, int nr,
+ 	if (WARN_ON(!vdev->v4l2_dev))
+ 		return -EINVAL;
+ 
++	INIT_LIST_HEAD(&vdev->list);
++
+ 	/* v4l2_fh support */
+ 	spin_lock_init(&vdev->fh_lock);
+ 	INIT_LIST_HEAD(&vdev->fh_list);
+@@ -991,6 +993,9 @@ int __video_register_device(struct video_device *vdev, int type, int nr,
+ 
+ 	/* Part 6: Activate this minor. The char device can now be used. */
+ 	set_bit(V4L2_FL_REGISTERED, &vdev->flags);
++	spin_lock(&vdev->v4l2_dev->lock);
++	list_add_tail(&vdev->list, &vdev->v4l2_dev->vdevs);
++	spin_unlock(&vdev->v4l2_dev->lock);
+ 
+ 	return 0;
+ 
+@@ -1026,6 +1031,9 @@ void video_unregister_device(struct video_device *vdev)
+ 	 */
+ 	clear_bit(V4L2_FL_REGISTERED, &vdev->flags);
+ 	mutex_unlock(&videodev_lock);
++	spin_lock(&vdev->v4l2_dev->lock);
++	list_del(&vdev->list);
++	spin_unlock(&vdev->v4l2_dev->lock);
+ 	device_unregister(&vdev->dev);
+ }
+ EXPORT_SYMBOL(video_unregister_device);
+diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l2-device.c
+index 937c6de85606..7a6ac03d58f9 100644
+--- a/drivers/media/v4l2-core/v4l2-device.c
++++ b/drivers/media/v4l2-core/v4l2-device.c
+@@ -36,6 +36,7 @@ int v4l2_device_register(struct device *dev, struct v4l2_device *v4l2_dev)
+ 		return -EINVAL;
+ 
+ 	INIT_LIST_HEAD(&v4l2_dev->subdevs);
++	INIT_LIST_HEAD(&v4l2_dev->vdevs);
+ 	spin_lock_init(&v4l2_dev->lock);
+ 	v4l2_prio_init(&v4l2_dev->prio);
+ 	kref_init(&v4l2_dev->ref);
+diff --git a/include/media/v4l2-dev.h b/include/media/v4l2-dev.h
+index e657614521e3..29d0c5ede518 100644
+--- a/include/media/v4l2-dev.h
++++ b/include/media/v4l2-dev.h
+@@ -212,6 +212,9 @@ struct v4l2_file_operations {
+ 
+ struct video_device
+ {
++	/* links into v4l2_device vdevs list */
++	struct list_head list;
++
+ #if defined(CONFIG_MEDIA_CONTROLLER)
+ 	struct media_entity entity;
+ 	struct media_intf_devnode *intf_devnode;
+diff --git a/include/media/v4l2-device.h b/include/media/v4l2-device.h
+index f11f079b2fa4..64176f773fa7 100644
+--- a/include/media/v4l2-device.h
++++ b/include/media/v4l2-device.h
+@@ -35,6 +35,7 @@ struct v4l2_ctrl_handler;
+  * @dev: pointer to struct device.
+  * @mdev: pointer to struct media_device
+  * @subdevs: used to keep track of the registered subdevs
++ * @vdevs: used to keep track of the registered video_devices
+  * @lock: lock this struct; can be used by the driver as well
+  *	if this struct is embedded into a larger struct.
+  * @name: unique device name, by default the driver name + bus ID
+@@ -63,6 +64,7 @@ struct v4l2_device {
+ 	struct media_device *mdev;
+ #endif
+ 	struct list_head subdevs;
++	struct list_head vdevs;
+ 	spinlock_t lock;
+ 	char name[V4L2_DEVICE_NAME_SIZE];
+ 	void (*notify)(struct v4l2_subdev *sd,
+-- 
+2.14.2
+
+From e9cd6ea619909f2037bfcd618bcf7fcfba2ce65d Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 11:31:38 +0200
+Subject: [PATCH 12/31] v4l2-device: add v4l2_device_req_queue
+
+The v4l2_device_req_queue() function is a helper that can be used
+as the req_queue callback in simple cases: it will walk over all
+registered video_devices and call vb2_qbuf_request() for each video
+device.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-device.c | 25 +++++++++++++++++++++++++
+ include/media/v4l2-device.h           |  3 +++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l2-device.c
+index 7a6ac03d58f9..5f53c9a7d092 100644
+--- a/drivers/media/v4l2-core/v4l2-device.c
++++ b/drivers/media/v4l2-core/v4l2-device.c
+@@ -29,6 +29,7 @@
+ #include <linux/videodev2.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ctrls.h>
++#include <media/videobuf2-v4l2.h>
+ 
+ int v4l2_device_register(struct device *dev, struct v4l2_device *v4l2_dev)
+ {
+@@ -321,3 +322,27 @@ void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
+ 		module_put(sd->owner);
+ }
+ EXPORT_SYMBOL_GPL(v4l2_device_unregister_subdev);
++
++int v4l2_device_req_queue(struct v4l2_device *v4l2_dev, u16 request)
++{
++	struct video_device *vdev;
++	struct video_device *tmp;
++	int err;
++
++	if (request == 0)
++		return -EINVAL;
++
++	list_for_each_entry_safe(vdev, tmp, &v4l2_dev->vdevs, list) {
++		if (vdev->queue == NULL || !vdev->queue->v4l2_allow_requests)
++			continue;
++		if (vdev->lock && mutex_lock_interruptible(vdev->lock))
++			return -ERESTARTSYS;
++		err = vb2_qbuf_request(vdev->queue, request, NULL);
++		if (vdev->lock)
++			mutex_unlock(vdev->lock);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(v4l2_device_req_queue);
+diff --git a/include/media/v4l2-device.h b/include/media/v4l2-device.h
+index 64176f773fa7..619d5b6a1662 100644
+--- a/include/media/v4l2-device.h
++++ b/include/media/v4l2-device.h
+@@ -218,6 +218,9 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
+ 		sd->v4l2_dev->notify(sd, notification, arg);
+ }
+ 
++/* For each registered video_device struct call vb2_qbuf_request(). */
++int v4l2_device_req_queue(struct v4l2_device *v4l2_dev, u16 request);
++
+ /* Iterate over all subdevs. */
+ #define v4l2_device_for_each_subdev(sd, v4l2_dev)			\
+ 	list_for_each_entry(sd, &(v4l2_dev)->subdevs, list)
+-- 
+2.14.2
+
+From f6d1348bc3eb894eae95d745f298c00f4ff1858f Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 13 Apr 2015 15:54:13 +0200
+Subject: [PATCH 13/31] vivid: add request support for video capture.
+
+In order to test the request API in applications we add request support to
+vivid. The brightness, contrast, saturation and hue controls now can be used
+in requests. Those were chosen because the test pattern generator supports
+those controls and will adjust the TPG colors accordingly, so this gives a
+good visual feedback.
+
+Just before a buffer with a specific request is ready to be filled, any
+controls set for that request are applied and the TPG will use the new
+values for filling in the buffer, so this matches what a well-written driver
+will do in actual hardware.
+
+Finally, support for req_queue is added using the new v4l2_device_req_queue
+helper function.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/platform/vivid/vivid-core.c        | 2 ++
+ drivers/media/platform/vivid/vivid-ctrls.c       | 4 ++++
+ drivers/media/platform/vivid/vivid-kthread-cap.c | 2 ++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/drivers/media/platform/vivid/vivid-core.c b/drivers/media/platform/vivid/vivid-core.c
+index ef344b9a48af..811bc3d66cd5 100644
+--- a/drivers/media/platform/vivid/vivid-core.c
++++ b/drivers/media/platform/vivid/vivid-core.c
+@@ -678,6 +678,7 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
+ 		return ret;
+ 	}
+ 	dev->v4l2_dev.release = vivid_dev_release;
++	dev->v4l2_dev.req_queue = v4l2_device_req_queue;
+ 
+ 	/* start detecting feature set */
+ 
+@@ -1071,6 +1072,7 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
+ 		q->min_buffers_needed = 2;
+ 		q->lock = &dev->mutex;
+ 		q->dev = dev->v4l2_dev.dev;
++		q->v4l2_allow_requests = 1;
+ 
+ 		ret = vb2_queue_init(q);
+ 		if (ret)
+diff --git a/drivers/media/platform/vivid/vivid-ctrls.c b/drivers/media/platform/vivid/vivid-ctrls.c
+index 34731f71cc00..1eac99fedacf 100644
+--- a/drivers/media/platform/vivid/vivid-ctrls.c
++++ b/drivers/media/platform/vivid/vivid-ctrls.c
+@@ -1411,12 +1411,16 @@ int vivid_create_controls(struct vivid_dev *dev, bool show_ccs_cap,
+ 			V4L2_CID_BRIGHTNESS, 0, 255, 1, 128);
+ 		for (i = 0; i < MAX_INPUTS; i++)
+ 			dev->input_brightness[i] = 128;
++		v4l2_ctrl_s_max_reqs(dev->brightness, VIDEO_MAX_FRAME);
+ 		dev->contrast = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
+ 			V4L2_CID_CONTRAST, 0, 255, 1, 128);
++		v4l2_ctrl_s_max_reqs(dev->contrast, VIDEO_MAX_FRAME);
+ 		dev->saturation = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
+ 			V4L2_CID_SATURATION, 0, 255, 1, 128);
++		v4l2_ctrl_s_max_reqs(dev->saturation, VIDEO_MAX_FRAME);
+ 		dev->hue = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
+ 			V4L2_CID_HUE, -128, 128, 1, 0);
++		v4l2_ctrl_s_max_reqs(dev->hue, VIDEO_MAX_FRAME);
+ 		v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
+ 			V4L2_CID_HFLIP, 0, 1, 1, 0);
+ 		v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
+diff --git a/drivers/media/platform/vivid/vivid-kthread-cap.c b/drivers/media/platform/vivid/vivid-kthread-cap.c
+index 6ca71aabb576..326eb37ef047 100644
+--- a/drivers/media/platform/vivid/vivid-kthread-cap.c
++++ b/drivers/media/platform/vivid/vivid-kthread-cap.c
+@@ -700,6 +700,8 @@ static void vivid_thread_vid_cap_tick(struct vivid_dev *dev, int dropped_bufs)
+ 	if (!list_empty(&dev->vid_cap_active)) {
+ 		vid_cap_buf = list_entry(dev->vid_cap_active.next, struct vivid_buffer, list);
+ 		list_del(&vid_cap_buf->list);
++		v4l2_ctrl_apply_request(dev->vid_cap_dev.ctrl_handler,
++					vid_cap_buf->vb.request);
+ 	}
+ 	if (!list_empty(&dev->vbi_cap_active)) {
+ 		if (dev->field_cap != V4L2_FIELD_ALTERNATE ||
+-- 
+2.14.2
+
+From afde8d7ba12ee44441cac73eca2fb39f48bcc1b4 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 12:30:04 +0200
+Subject: [PATCH 14/31] v4l2-ctrls: add REQ_KEEP flag
+
+Experimental: I am still not certain whether this is desired or not.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c  | 28 ++++++++++++++++++++--------
+ drivers/media/v4l2-core/v4l2-ioctl.c  |  9 ++++++++-
+ drivers/media/v4l2-core/v4l2-subdev.c | 11 ++++++++++-
+ include/media/v4l2-ctrls.h            |  3 +++
+ include/media/v4l2-fh.h               |  3 +++
+ include/uapi/linux/videodev2.h        |  4 ++++
+ 6 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 91db97f16133..78d2a8b06be4 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -2721,6 +2721,8 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
+ 	if (req) {
+ 		if (ctrl_req->applied)
+ 			qc->flags |= V4L2_CTRL_FLAG_REQ_APPLIED;
++		if (ctrl_req->keep)
++			qc->flags |= V4L2_CTRL_FLAG_REQ_KEEP;
+ 	}
+ 	qc->max_reqs = ctrl->max_reqs;
+ 	qc->type = ctrl->type;
+@@ -3156,7 +3158,7 @@ EXPORT_SYMBOL(v4l2_ctrl_g_ctrl_int64);
+    copied to the current value on a set.
+    Must be called with ctrl->handler->lock held. */
+ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+-			      u16 request, bool set, u32 ch_flags)
++			      u16 request, bool keep, bool set, u32 ch_flags)
+ {
+ 	bool update_flag;
+ 	int ret;
+@@ -3180,6 +3182,8 @@ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+ 				if (ret)
+ 					return ret;
+ 			}
++			if (set)
++				req->keep = keep;
+ 		}
+ 		ctrl->request = req;
+ 		if (!ctrl->is_new) {
+@@ -3280,6 +3284,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 	struct v4l2_ctrl_helper helper[4];
+ 	struct v4l2_ctrl_helper *helpers = helper;
+ 	unsigned request = 0;
++	bool keep = false;
+ 	unsigned i, j;
+ 	int ret;
+ 
+@@ -3289,10 +3294,12 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 	if (cs->which == V4L2_CTRL_WHICH_DEF_VAL)
+ 		return -EINVAL;
+ 
+-	if (V4L2_CTRL_ID2WHICH(cs->which))
++	if (V4L2_CTRL_ID2WHICH(cs->which)) {
+ 		cs->which = V4L2_CTRL_ID2WHICH(cs->which);
+-	else
++	} else {
+ 		request = cs->request;
++		keep = set && (cs->request & V4L2_CTRL_REQ_FL_KEEP);
++	}
+ 
+ 	if (hdl == NULL || request > USHRT_MAX)
+ 		return -EINVAL;
+@@ -3364,7 +3371,8 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		} while (!ret && idx);
+ 
+ 		if (!ret)
+-			ret = try_or_set_cluster(fh, master, request, set, 0);
++			ret = try_or_set_cluster(fh, master, request,
++						 keep, set, 0);
+ 
+ 		/* Copy the new values back to userspace. */
+ 		if (!ret) {
+@@ -3424,7 +3432,7 @@ static int set_ctrl(struct v4l2_fh *fh, unsigned request,
+ 		update_from_auto_cluster(master);
+ 
+ 	ctrl->is_new = 1;
+-	return try_or_set_cluster(fh, master, request, true, ch_flags);
++	return try_or_set_cluster(fh, master, request, false, true, ch_flags);
+ }
+ 
+ /* Helper function for VIDIOC_S_CTRL compatibility */
+@@ -3512,6 +3520,7 @@ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
+ 	list_for_each_entry(ref, &hdl->ctrl_refs, node) {
+ 		struct v4l2_ctrl *master;
+ 		bool apply_request = false;
++		bool keep = false;
+ 
+ 		if (ref->ctrl->max_reqs == 0)
+ 			continue;
+@@ -3530,9 +3539,11 @@ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
+ 			if (ctrl->request == NULL)
+ 				continue;
+ 			found_request = true;
+-			if (!ctrl->request->applied) {
++			if (ctrl->request->keep || !ctrl->request->applied) {
+ 				request_to_new(master->cluster[i]);
+ 				apply_request = true;
++				if (ctrl->request->keep)
++					keep = true;
+ 				ctrl->request->applied = 1;
+ 			}
+ 		}
+@@ -3543,7 +3554,8 @@ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
+ 		}
+ 
+ 		/*
+-		 * Skip if it is a request that has already been applied.
++		 * Skip if it is a one-off request that has already been
++		 * applied.
+ 		 */
+ 		if (!apply_request)
+ 			goto unlock;
+@@ -3564,7 +3576,7 @@ int v4l2_ctrl_apply_request(struct v4l2_ctrl_handler *hdl, unsigned request)
+ 				update_from_auto_cluster(master);
+ 		}
+ 
+-		try_or_set_cluster(NULL, master, 0, true, 0);
++		try_or_set_cluster(NULL, master, 0, keep, true, 0);
+ 
+ unlock:
+ 		if (master->handler != hdl)
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 6f7f6a88942c..92c955c04746 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2139,8 +2139,11 @@ static int v4l_s_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler) {
+-		if (vfh->request && p->request == 0)
++		if (vfh->request && p->request == 0) {
+ 			p->request = vfh->request;
++			if (vfh->flags & V4L2_FH_FL_KEEP)
++				p->request |= V4L2_CTRL_REQ_FL_KEEP;
++		}
+ 		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, p);
+ 	}
+ 	if (vfd->ctrl_handler)
+@@ -2351,6 +2354,10 @@ static int v4l_request_cmd(const struct v4l2_ioctl_ops *ops,
+ 		if (p->request == 0)
+ 			return -EINVAL;
+ 		vfh->request = p->request;
++		if (p->flags & V4L2_REQ_CMD_BEGIN_FL_KEEP)
++			vfh->flags |= V4L2_FH_FL_KEEP;
++		else
++			vfh->flags &= ~V4L2_FH_FL_KEEP;
+ 		break;
+ 	case V4L2_REQ_CMD_END:
+ 		vfh->request = 0;
+diff --git a/drivers/media/v4l2-core/v4l2-subdev.c b/drivers/media/v4l2-core/v4l2-subdev.c
+index c1da78c7ff6c..e88ea6b52a96 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev.c
++++ b/drivers/media/v4l2-core/v4l2-subdev.c
+@@ -211,14 +211,19 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 
+ 		if (vfh->request && p->request == 0)
+ 			p->request = vfh->request;
++		else if (p->request > USHRT_MAX)
++			return -EINVAL;
+ 		return v4l2_g_ext_ctrls(vfh->ctrl_handler, arg);
+ 	}
+ 
+ 	case VIDIOC_S_EXT_CTRLS: {
+ 		struct v4l2_ext_controls *p = arg;
+ 
+-		if (vfh->request && p->request == 0)
++		if (vfh->request && p->request == 0) {
+ 			p->request = vfh->request;
++			if (vfh->flags & V4L2_FH_FL_KEEP)
++				p->request |= V4L2_CTRL_REQ_FL_KEEP;
++		}
+ 		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, arg);
+ 	}
+ 
+@@ -255,6 +260,10 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 			if (p->request == 0)
+ 				return -EINVAL;
+ 			vfh->request = p->request;
++			if (p->flags & V4L2_REQ_CMD_BEGIN_FL_KEEP)
++				vfh->flags |= V4L2_FH_FL_KEEP;
++			else
++				vfh->flags &= ~V4L2_FH_FL_KEEP;
+ 			break;
+ 		case V4L2_REQ_CMD_END:
+ 			vfh->request = 0;
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index e90433eb6b19..dcb91cf050df 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -32,6 +32,8 @@ struct v4l2_subscribed_event;
+ struct v4l2_fh;
+ struct poll_table_struct;
+ 
++#define V4L2_CTRL_REQ_FL_KEEP (1UL << 31)
++
+ /**
+  * union v4l2_ctrl_ptr - A pointer to a control value.
+  * @p_s32:	Pointer to a 32-bit signed value.
+@@ -108,6 +110,7 @@ typedef void (*v4l2_ctrl_notify_fnc)(struct v4l2_ctrl *ctrl, void *priv);
+ struct v4l2_ctrl_req {
+ 	struct list_head node;
+ 	u32 request;
++	unsigned keep:1;
+ 	unsigned applied:1;
+ 	union v4l2_ctrl_ptr ptr;
+ };
+diff --git a/include/media/v4l2-fh.h b/include/media/v4l2-fh.h
+index 25aef57180bb..244dcec10009 100644
+--- a/include/media/v4l2-fh.h
++++ b/include/media/v4l2-fh.h
+@@ -28,6 +28,8 @@
+ struct video_device;
+ struct v4l2_ctrl_handler;
+ 
++#define V4L2_FH_FL_KEEP	(1 << 0)
++
+ /**
+  * struct v4l2_fh - Describes a V4L2 file handler
+  *
+@@ -56,6 +58,7 @@ struct v4l2_fh {
+ 	unsigned int		navailable;
+ 	u32			sequence;
+ 	u16			request;
++	u16			flags;
+ 
+ #if IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
+ 	struct v4l2_m2m_ctx	*m2m_ctx;
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 63cebaec01da..aaa3a4a29c55 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1669,6 +1669,7 @@ struct v4l2_querymenu {
+ #define V4L2_CTRL_FLAG_EXECUTE_ON_WRITE	0x0200
+ #define V4L2_CTRL_FLAG_MODIFY_LAYOUT	0x0400
+ #define V4L2_CTRL_FLAG_REQ_APPLIED	0x0800
++#define V4L2_CTRL_FLAG_REQ_KEEP		0x1000
+ 
+ /*  Query flags, to be ORed with the control ID */
+ #define V4L2_CTRL_FLAG_NEXT_CTRL	0x80000000
+@@ -2303,6 +2304,9 @@ struct v4l2_create_buffers {
+ #define V4L2_REQ_CMD_APPLY	(3)
+ #define V4L2_REQ_CMD_QUEUE	(4)
+ 
++/* Flag for V4L2_REQ_CMD_BEGIN */
++#define V4L2_REQ_CMD_BEGIN_FL_KEEP	(1 << 0)
++
+ struct v4l2_request_cmd {
+ 	__u32 cmd;
+ 	__u16 request;
+-- 
+2.14.2
+
+From f96ce25aa07e7affec7359e3870b215c47a358be Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Tue, 21 Apr 2015 14:39:34 +0200
+Subject: [PATCH 15/31] Documentation: add v4l2-requests.txt
+
+Add documentation about requests.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ Documentation/video4linux/v4l2-requests.txt | 233 ++++++++++++++++++++++++++++
+ 1 file changed, 233 insertions(+)
+ create mode 100644 Documentation/video4linux/v4l2-requests.txt
+
+diff --git a/Documentation/video4linux/v4l2-requests.txt b/Documentation/video4linux/v4l2-requests.txt
+new file mode 100644
+index 000000000000..324a84077b71
+--- /dev/null
++++ b/Documentation/video4linux/v4l2-requests.txt
+@@ -0,0 +1,233 @@
++Introduction
++============
++
++It is often useful to apply certain settings when a buffer is about to be
++filled by the DMA capture of a video capture device, ensuring that those
++settings are applied in time for them to be used with that buffer.
++
++One of the prime use-cases of this is Android's CameraHAL v3 which requires
++per-frame configuration support.
++
++But other use-cases are possible as well: changing codec settings (bit rate,
++etc.) starting with a specific buffer, preparing a configuration to be applied
++at a certain time, etc.
++
++The request API is the way V4L2 solved this problem.
++
++
++Basic Mechanism
++===============
++
++Requests are implemented by building on top of the control framework, adding
++new 'request' fields to various v4l2 structs and by adding a new ioctl:
++VIDIOC_REQUEST_CMD.
++
++The core are the additions to the control framework: normally when a control
++is set the control's value is applied immediately in the hardware. But the
++request API allows you to specify the control value for a specific request
++ID (from 1-0xffff). The control value is validated and stored for that request,
++but it won't be applied until later.
++
++Each control can support up to N requests where N is expected to be a multiple
++of VIDEO_MAX_FRAME. If N is 0, then it cannot be used with requests. Many
++controls (e.g. V4L2_CID_POWER_LINE_FREQUENCY) just make no sense in a request
++context.
++
++How many requests each control supports can be queried with VIDIOC_QUERY_EXT_CTRL
++and by checking the max_reqs field.
++
++Getting/setting/trying controls for a request can be done in two ways: one
++is to use the VIDIOC_REQUEST_CMD ioctl (more about that later), the other is
++to use VIDIOC_G/S/TRY_EXT/CTRLS and fill in a non-zero request ID. If the
++request ID is 0, then the normal behavior applies: so controls are set immediately.
++
++Request IDs are in the range of 1-65535. Applications can freely choose them,
++but controls won't support more than a fixed number of different requests.
++Requests can be deleted, see the section on VIDIOC_REQUEST_CMD.
++
++The expected usage is that request IDs are some base value + the buffer index.
++Request lookup is optimized for that scheme inside the control framework: there
++is a hash table of size VIDEO_MAX_FRAME, each element being a linked list.
++The hash function used is 'request % VIDEO_MAX_FRAME', and then the linked list
++is walked to find whether the request is in there. The expectation is that
++having more than VIDEO_MAX_FRAME requests will be very unusual, and certainly
++that the maximum number of possible requests in flight at the same time won't
++be more than a small multiple of VIDEO_MAX_FRAME.
++
++Associating a buffer with a specific request can be done by setting the new
++'request' field in struct v4l2_buffer to the request ID.
++
++Once a buffer is queued with a non-zero request ID, then it is up to the
++driver to apply the control values for that request at the right time ensuring
++that when the buffer is DMAed those values are in effect.
++
++This is entirely hardware specific, so it is the driver's responsibility. It
++will know the request ID of a buffer as soon as the vb2 buf_queue op is called.
++
++For simple cases a helper function v4l2_ctrl_apply_request() is available that
++will just apply any controls for the given request immediately. The driver can
++call that when the buffer is about to be filled. This is likely to be too crude
++for the more complex devices, in particular when dealing with settings that can
++take some time before that will take effect (e.g. focussing).
++
++
++Complex Devices
++===============
++
++For complex devices with lots of video and v4l-subdev device nodes you want to
++be able to synchronize buffers and controls for multiple nodes and apply them
++all as a single request.
++
++The way to do that is to:
++
++1) use the same request ID for all device nodes when setting controls for that
++   request.
++2) instead of using VIDIOC_QBUF use VIDIOC_PREPARE_BUF with the request field
++   set everywhere you need to have a buffer associated with the request.
++3) when all is done, call VIDIOC_REQUEST_CMD(V4L2_REQ_CMD_QUEUE) with the
++   request ID on any video or v4l-subdev node.
++
++The V4L2_REQ_CMD_QUEUE command will call a top-level 'req_queue' callback in
++the driver, at which point it is the responsibility of the driver to pull
++everything together and ensure that all prepared buffers are queued up at the
++right time to the DMA queues and all controls for that request will be applied
++at the right moment.
++
++Two helper functions were created to aid with with: vb2_qbuf_request() will
++queue up a prepared buffer with the given request ID. And v4l2_device_req_queue()
++will walk all video_device structs and do just that for each of them. The last
++function only works for simple devices, complex devices will almost certainly
++need to create their own function.
++
++
++Feedback
++========
++
++After a buffer is dequeued you can get the control values that were actually
++used when filling in that buffer by calling VIDIOC_G_EXT_CTRLS with the request
++field set to buffer->request. This can also be used to obtain additional meta
++information by creating read-only controls that are filled in by the driver
++for that specific buffer.
++
++Currently there is no event that is triggered when someone sets a new control
++value for a specific request. This can be added, but I suspect it will make
++more sense to have driver-specific events (e.g. 'EVENT_METADATA_AVAILABLE')
++that applications can use.
++
++A new control flag was added: V4L2_CTRL_FLAG_REQ_APPLIED. If set, then the
++control value for the request was applied.
++
++Note: once the control value for a request has been applied it will never be
++applied again. Only after it has been set again (using VIDIOC_S_EXT_CTRLS)
++will the control value for that request be applied.
++
++Using VIDIOC_REQUEST_CMD it is possible to keep applied values and reapply
++them, but that is not the standard behavior and is experimental since it
++is not clear whether this is actually needed (or even wanted).
++
++
++VIDIOC_REQUEST_CMD
++==================
++
++#define V4L2_REQ_CMD_BEGIN      (0)
++#define V4L2_REQ_CMD_END        (1)
++#define V4L2_REQ_CMD_DELETE     (2)
++#define V4L2_REQ_CMD_APPLY      (3)
++#define V4L2_REQ_CMD_QUEUE      (4)
++
++/* Flag for V4L2_REQ_CMD_BEGIN */
++#define V4L2_REQ_CMD_BEGIN_FL_KEEP      (1 << 0)
++
++struct v4l2_request_cmd {
++        __u32 cmd;
++        __u16 request;
++        __u16 flags;
++        union {
++                struct {
++                        __u32 data[8];
++                } raw;
++        };
++};
++
++The VIDIOC_REQUEST_CMD ioctl is used for a variety of request-related
++purposes. These will be explained in more detail below.
++
++V4L2_REQ_CMD_BEGIN/END
++----------------------
++
++While it is easy to use VIDIOC_S_EXT_CTRLS to set control values for a specific
++request, you cannot do that with VIDIOC_S_CTRL since there is no request field
++in the v4l2_control struct. And in fact it is desirable to be able to use other
++ioctls with requests as well (e.g. VIDIOC_S_SELECTION).
++
++In order to allow other ioctls to be used as part of a request you can use the
++BEGIN/END commands to bracket a bunch of other ioctls, all of which (where
++appropriate) will be stored as part of the request.
++
++Currently this is only implemented for the control ioctls. But VIDIOC_S_SELECTION
++is a prime candidate for the future. Internally however, the selection data
++would have to be stored as a control since all request data are always controls.
++
++Whether ioctls apply to a request is per-filehandle: calling VIDIOC_REQUEST_CMD
++with V4L2_REQ_CMD_BEGIN will mark the filehandle that future ioctls need to be
++applied to the specified request. V4L2_REQ_CMD_END will 'unmark' the filehandle
++and everything will be back to normal.
++
++Calling V4L2_REQ_CMD_BEGIN with the V4L2_REQ_CMD_BEGIN_FL_KEEP flag will prevent
++request control values to be discarded after they are applied. Instead they will
++be kept and re-applied the next time controls for that request need to be set.
++
++V4L2_REQ_CMD_DELETE
++-------------------
++
++Delete all control values for the given request (if non-zero) or delete all
++control request values for all requests (if zero).
++
++This is recommended at the beginning of the application to discard any old
++request control values from the driver.
++
++V4L2_REQ_CMD_APPLY
++------------------
++
++Explicitly apply the control values for the given request. This takes effect
++immediately.
++
++V4L2_REQ_CMD_QUEUE
++------------------
++
++Queue all buffers for the given request for all device nodes. This may not be
++supported by the driver. Test this by calling it with request 0: if ENOSYS is
++returned, then this functionality is not supported.
++
++
++Miscellaneous
++=============
++
++The vivid driver has support for all this: the brightness, contrast, saturation
++and hue controls all support up to VIDEO_MAX_FRAME requests.
++
++Git tree for these patches:
++
++http://git.linuxtv.org/cgit.cgi/hverkuil/media_tree.git/log/?h=requests
++
++Utilities with support for requests are available here:
++
++http://git.linuxtv.org/cgit.cgi/hverkuil/v4l-utils.git/log/?h=requests
++
++Remaining questions:
++
++- Should we keep the V4L2_REQ_CMD_BEGIN_FL_KEEP flag?
++- Do we need request-related events? And if so, which events are needed?
++- Anything missing?
++
++Known TODOs:
++
++- DocBook patches: have to wait until this is ready to be merged, which will
++  require an actual driver that wants to use it.
++- Almost certainly: add support for VIDIOC_G/S_SELECTION and requests. An
++  older version of this work exists, but it needs to be reworked quite a
++  bit. Contact me if this is needed.
++
++In case of questions contact me:
++
++Hans Verkuil <hverkuil@xs4all.nl>
+-- 
+2.14.2
+
