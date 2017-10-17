@@ -1,0 +1,81 @@
+diff -Nur a/configure.ac b/configure.ac
+--- a/configure.ac	2017-10-14 20:32:09.000000000 +0200
++++ b/configure.ac	2017-10-17 19:08:44.527023199 +0200
+@@ -62,7 +62,6 @@
+ 
+ dnl Check for VA-API
+ PKG_CHECK_MODULES(LIBVA_DEPS,     [libva >= va_api_version])
+-PKG_CHECK_MODULES(X11_DEPS, [x11])
+ 
+ dnl Check for VA/DRM API
+ PKG_CHECK_MODULES(LIBVA_DRM_DEPS, [libva-drm],
+diff -Nur a/src/surface.c b/src/surface.c
+--- a/src/surface.c	2017-10-14 20:32:09.000000000 +0200
++++ b/src/surface.c	2017-10-17 19:10:30.017294187 +0200
+@@ -36,8 +36,6 @@
+ 
+ #include <linux/videodev2.h>
+ 
+-#include <X11/Xlib.h>
+-
+ /*
+  * A Surface is an internal data structure never handled by the VA's user
+  * containing the output of a rendering. Usualy, a bunch of surfaces are created
+@@ -223,56 +221,13 @@
+ 	return vaStatus;
+ }
+ 
+-/* WARNING: This is for development purpose only!!! */
+ VAStatus sunxi_cedrus_PutSurface(VADriverContextP ctx, VASurfaceID surface,
+ 		void *draw, short srcx, short srcy, unsigned short srcw,
+ 		unsigned short srch, short destx, short desty,
+ 		unsigned short destw, unsigned short desth,
+ 		VARectangle *cliprects, unsigned int number_cliprects,
+ 		unsigned int flags)
+-{
+-	INIT_DRIVER_DATA
+-	GC gc;
+-	Display *display;
+-	const XID xid = (XID)(uintptr_t)draw;
+-	XColor xcolor;
+-	int screen;
+-	Colormap cm;
+-	int colorratio = 65535 / 255;
+-	int x, y;
+-	object_surface_p obj_surface;
+-
+-	obj_surface = SURFACE(surface);
+-	assert(obj_surface);
+-
+-	display = XOpenDisplay(getenv("DISPLAY"));
+-	if (display == NULL) {
+-		sunxi_cedrus_msg("Cannot connect to X server\n");
+-		exit(1);
+-	}
+-
+-	sunxi_cedrus_msg("warning: using vaPutSurface with sunxi-cedrus is not recommended\n");
+-	screen = DefaultScreen(display);
+-	gc =  XCreateGC(display, RootWindow(display, screen), 0, NULL);
+-	XSync(display, False);
+-
+-	cm = DefaultColormap(display, screen);
+-	xcolor.flags = DoRed | DoGreen | DoBlue;
+-
+-	for(x=destx; x < destx+destw; x++) {
+-		for(y=desty; y < desty+desth; y++) {
+-			char lum = driver_data->luma_bufs[obj_surface->output_buf_index][x+srcw*y];
+-			xcolor.red = xcolor.green = xcolor.blue = lum*colorratio;
+-			XAllocColor(display, cm, &xcolor);
+-			XSetForeground(display, gc, xcolor.pixel);
+-			XDrawPoint(display, xid, gc, x, y);
+-		}
+-	}
+-
+-	XFlush(display);
+-	XCloseDisplay(display);
+-	return VA_STATUS_SUCCESS;
+-}
++{ return VA_STATUS_ERROR_UNIMPLEMENTED; }
+ 
+ VAStatus sunxi_cedrus_LockSurface(VADriverContextP ctx, VASurfaceID surface,
+ 		unsigned int *fourcc, unsigned int *luma_stride,

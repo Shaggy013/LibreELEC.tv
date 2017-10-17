@@ -19,7 +19,7 @@
 PKG_NAME="libva"
 PKG_VERSION="1.8.3"
 PKG_SHA256="56ee129deba99b06eb4a8d4f746b117c5d1dc2ec5b7a0bfc06971fca1598ab9b"
-PKG_ARCH="x86_64"
+PKG_ARCH="x86_64 arm"
 PKG_LICENSE="GPL"
 PKG_SITE="https://01.org/linuxmedia"
 PKG_URL="https://github.com/01org/libva/releases/download/$PKG_VERSION/$PKG_NAME-$PKG_VERSION.tar.bz2"

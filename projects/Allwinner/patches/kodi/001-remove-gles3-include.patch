@@ -1,0 +1,77 @@
+diff -Nur a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp	2017-10-02 21:40:20.000000000 +0200
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp	2017-10-17 21:55:19.692347722 +0200
+@@ -75,10 +75,6 @@
+   {
+     tex.Init(interop);
+   }
+-  for (auto &fence : m_fences)
+-  {
+-    fence = GL_NONE;
+-  }
+ 
+   return CLinuxRendererGLES::Configure(picture, fps, flags, orientation);
+ }
+@@ -226,42 +222,15 @@
+ 
+ void CRendererVAAPI::AfterRenderHook(int idx)
+ {
+-  if (glIsSync(m_fences[idx]))
+-  {
+-    glDeleteSync(m_fences[idx]);
+-    m_fences[idx] = GL_NONE;
+-  }
+-  m_fences[idx] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+ }
+ 
+ bool CRendererVAAPI::NeedBuffer(int idx)
+ {
+-  if (glIsSync(m_fences[idx]))
+-  {
+-    GLint state;
+-    GLsizei length;
+-    glGetSynciv(m_fences[idx], GL_SYNC_STATUS, 1, &length, &state);
+-    if (state == GL_SIGNALED)
+-    {
+-      glDeleteSync(m_fences[idx]);
+-      m_fences[idx] = GL_NONE;
+-    }
+-    else
+-    {
+-      return true;
+-    }
+-  }
+-
+   return false;
+ }
+ 
+ void CRendererVAAPI::ReleaseBuffer(int idx)
+ {
+-  if (glIsSync(m_fences[idx]))
+-  {
+-    glDeleteSync(m_fences[idx]);
+-    m_fences[idx] = GL_NONE;
+-  }
+   m_vaapiTextures[idx].Unmap();
+   CLinuxRendererGLES::ReleaseBuffer(idx);
+ }
+diff -Nur a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h	2017-10-02 21:40:20.000000000 +0200
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h	2017-10-17 20:41:21.946098114 +0200
+@@ -59,5 +59,4 @@
+ 
+   bool m_isVAAPIBuffer = true;
+   VAAPI::CVaapiTexture m_vaapiTextures[NUM_BUFFERS];
+-  GLsync m_fences[NUM_BUFFERS];
+ };
+diff -Nur a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.h
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.h	2017-10-17 20:16:52.369567278 +0200
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.h	2017-10-17 20:40:45.515437340 +0200
+@@ -25,7 +25,6 @@
+ #elif defined(HAVE_LIBGLESV2)
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
+-#include <GLES3/gl3.h>
+ #endif
+ 
+ #include <EGL/egl.h>

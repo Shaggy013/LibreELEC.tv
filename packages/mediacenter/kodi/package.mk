@@ -168,7 +168,11 @@ else
 fi
 
 if [ "$VAAPI_SUPPORT" = yes ]; then
-  PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET intel-vaapi-driver"
+  if [ "$PROJECT" = "Allwinner" ]; then
+    PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET sunxi-vaapi-driver"
+  else
+    PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET intel-vaapi-driver"
+  fi
   KODI_VAAPI="-DENABLE_VAAPI=ON"
 else
   KODI_VAAPI="-DENABLE_VAAPI=OFF"

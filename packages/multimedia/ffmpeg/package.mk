@@ -35,7 +35,11 @@ PKG_AUTORECONF="no"
 get_graphicdrivers
 
 if [ "$VAAPI_SUPPORT" = "yes" ]; then
-  PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET intel-vaapi-driver"
+  if [ "$PROJECT" = "Allwinner" ]; then
+    PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET sunxi-vaapi-driver"
+  else
+    PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET intel-vaapi-driver"
+  fi
   FFMPEG_VAAPI="--enable-vaapi"
 else
   FFMPEG_VAAPI="--disable-vaapi"
