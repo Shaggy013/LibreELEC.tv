@@ -1,0 +1,51 @@
+From f276e93ec6632beaf9b31d26ee89a59af4b95208 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Fri, 20 Jul 2018 14:08:39 +0200
+Subject: [PATCH] RendererDRMPRIME: Fixup DRM modifiers support
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ .../VideoRenderers/HwDecRender/RendererDRMPRIME.cpp      | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index 1fce1277b9..55773ccf03 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -31,6 +31,9 @@
+ #include "windowing/gbm/DRMAtomic.h"
+ #include "windowing/GraphicContext.h"
+ 
++#include <drm_fourcc.h>
++#include <errno.h>
++
+ const std::string SETTING_VIDEOPLAYER_USEPRIMERENDERER = "videoplayer.useprimerenderer";
+ 
+ CRendererDRMPRIME::CRendererDRMPRIME(std::shared_ptr<CDRMUtils> drm)
+@@ -214,6 +217,7 @@ void CRendererDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer)
+   {
+     uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
+     uint64_t modifier[4] = {0};
++    uint32_t flags = 0;
+     int ret;
+ 
+     // convert Prime FD to GEM handle
+@@ -239,11 +243,14 @@ void CRendererDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer)
+         pitches[plane] = layer->planes[plane].pitch;
+         offsets[plane] = layer->planes[plane].offset;
+         modifier[plane] = descriptor->objects[object].format_modifier;
++
++	if (modifier[plane] != DRM_FORMAT_MOD_NONE && modifier[plane] != DRM_FORMAT_MOD_INVALID)
++          flags |= DRM_MODE_FB_MODIFIERS;
+       }
+     }
+ 
+     // add the video frame FB
+-    ret = drmModeAddFB2WithModifiers(m_DRM->GetFileDescriptor(), buffer->GetWidth(), buffer->GetHeight(), layer->format, handles, pitches, offsets, modifier, &buffer->m_fb_id, 0);
++    ret = drmModeAddFB2WithModifiers(m_DRM->GetFileDescriptor(), buffer->GetWidth(), buffer->GetHeight(), layer->format, handles, pitches, offsets, modifier, &buffer->m_fb_id, flags);
+     if (ret < 0)
+     {
+       CLog::Log(LOGERROR, "CRendererDRMPRIME::%s - failed to add drm layer %d, ret = %d", __FUNCTION__, buffer->m_fb_id, ret);
+-- 
+2.18.0
+

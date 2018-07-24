@@ -113,6 +113,12 @@ get_graphicdrivers() {
     VDPAU_SUPPORT="no"
   fi
 
+  if [ "$PROJECT" = "Allwinner" ]; then
+    V4L2_SUPPORT="no"
+    VAAPI_SUPPORT="yes"
+    VDPAU_SUPPORT="no"
+  fi
+
   # remove leading comma if present
   [[ $GALLIUM_DRIVERS =~ ^, ]] && GALLIUM_DRIVERS="${GALLIUM_DRIVERS:1}"
   [[ $DRI_DRIVERS =~ ^, ]] && DRI_DRIVERS="${DRI_DRIVERS:1}"

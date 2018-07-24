@@ -159,7 +159,7 @@ else
   KODI_VDPAU="-DENABLE_VDPAU=OFF"
 fi
 
-if [ "$VAAPI_SUPPORT" = yes ]; then
+if [ "$VAAPI_SUPPORT" = yes -a "$PROJECT" != "Allwinner" ]; then
   PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET libva"
   KODI_VAAPI="-DENABLE_VAAPI=ON"
 else

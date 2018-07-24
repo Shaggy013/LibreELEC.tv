@@ -1,0 +1,87 @@
+From f20425dbc47db5906e6f4426de94b159efe205d1 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 20 Jun 2018 10:01:08 +0200
+Subject: [PATCH 3/6] Revert "DVDVideoCodecDRMPRIME: use avcodec_get_hw_config
+ to check if codec is supported"
+
+This reverts commit 96ed41d3169c5e4ace12704891626220bccc13b5.
+---
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp | 36 ++++++-------------
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |  1 +
+ 2 files changed, 12 insertions(+), 25 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 4e2f0422d5..9aa6450db4 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -171,36 +171,23 @@ void CDVDVideoCodecDRMPRIME::Register()
+   CDVDFactoryCodec::RegisterHWVideoCodec("drm_prime", CDVDVideoCodecDRMPRIME::Create);
+ }
+ 
+-static const AVCodecHWConfig* FindHWConfig(const AVCodec* codec)
+-{
+-  const AVCodecHWConfig* config = nullptr;
+-  for (int n = 0; (config = avcodec_get_hw_config(codec, n)); n++)
+-  {
+-    if (config->pix_fmt != AV_PIX_FMT_DRM_PRIME)
+-      continue;
+-
+-    if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_INTERNAL))
+-      return config;
+-  }
+-
+-  return nullptr;
+-}
+-
+-static const AVCodec* FindDecoder(CDVDStreamInfo& hints)
++const AVCodec* CDVDVideoCodecDRMPRIME::FindDecoder(CDVDStreamInfo& hints)
+ {
+   const AVCodec* codec = nullptr;
+   void *i = 0;
+ 
+   while ((codec = av_codec_iterate(&i)))
+   {
+-    if (!av_codec_is_decoder(codec))
+-      continue;
+-    if (codec->id != hints.codec)
+-      continue;
+-
+-    const AVCodecHWConfig* config = FindHWConfig(codec);
+-    if (config)
+-      return codec;
++    if (av_codec_is_decoder(codec) && codec->id == hints.codec && codec->pix_fmts)
++    {
++      const AVPixelFormat* fmt = codec->pix_fmts;
++      while (*fmt != AV_PIX_FMT_NONE)
++      {
++        if (*fmt == AV_PIX_FMT_DRM_PRIME)
++          return codec;
++        fmt++;
++      }
++    }
+   }
+ 
+   return nullptr;
+@@ -221,7 +208,6 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+   if (!m_pCodecContext)
+     return false;
+ 
+-  m_pCodecContext->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+   m_pCodecContext->codec_tag = hints.codec_tag;
+   m_pCodecContext->coded_width = hints.width;
+   m_pCodecContext->coded_height = hints.height;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index efc765751c..3c5ccfadf2 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -71,6 +71,7 @@ public:
+   void SetCodecControl(int flags) override { m_codecControlFlags = flags; };
+ 
+ protected:
++  const AVCodec* FindDecoder(CDVDStreamInfo& hints);
+   void Drain();
+   void SetPictureParams(VideoPicture* pVideoPicture);
+ 
+-- 
+2.18.0
+

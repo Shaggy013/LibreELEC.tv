@@ -1,0 +1,41 @@
+From 23d10518314b5591c2105d8392a0992da20b5ba5 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 20 Jun 2018 10:00:42 +0200
+Subject: [PATCH 1/6] Revert "DVDVideoCodecDRMPRIME: add get_format callback"
+
+This reverts commit 7e2f2ac749c2ef65f95ff86daee212643e2ec2d8.
+---
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp          | 10 ----------
+ 1 file changed, 10 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 34b6418297..98615a3f73 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -211,15 +211,6 @@ static const AVCodec* FindDecoder(CDVDStreamInfo& hints)
+   return nullptr;
+ }
+ 
+-static enum AVPixelFormat GetFormat(struct AVCodecContext* avctx, const enum AVPixelFormat* fmt)
+-{
+-  for (int n = 0; fmt[n] != AV_PIX_FMT_NONE; n++)
+-    if (fmt[n] == AV_PIX_FMT_DRM_PRIME)
+-      return fmt[n];
+-
+-  return AV_PIX_FMT_NONE;
+-}
+-
+ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& options)
+ {
+   const AVCodec* pCodec = FindDecoder(hints);
+@@ -250,7 +241,6 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+   }
+ 
+   m_pCodecContext->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+-  m_pCodecContext->get_format = GetFormat;
+   m_pCodecContext->codec_tag = hints.codec_tag;
+   m_pCodecContext->coded_width = hints.width;
+   m_pCodecContext->coded_height = hints.height;
+-- 
+2.18.0
+

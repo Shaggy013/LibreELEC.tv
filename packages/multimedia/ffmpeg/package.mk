@@ -30,6 +30,10 @@ fi
 if [ "$VAAPI_SUPPORT" = "yes" ]; then
   PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET libva"
   PKG_FFMPEG_VAAPI="--enable-vaapi"
+  if [ "$PROJECT" = "Allwinner" ]; then
+    PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET libdrm"
+    PKG_FFMPEG_VAAPI="--enable-libdrm"
+  fi
 else
   PKG_FFMPEG_VAAPI="--disable-vaapi"
 fi
