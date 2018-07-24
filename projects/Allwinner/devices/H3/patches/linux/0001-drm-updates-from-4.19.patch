@@ -1,0 +1,3263 @@
+From 365d0c5bbd7dc80658f59c350d1f469a9f3ce777 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 13 Mar 2018 09:13:01 +0100
+Subject: [PATCH 01/25] drm/sun4i: Disable frontend video channel before
+ enabling a layer
+
+This adds a dedicated function for disabling the layer video channel
+from the frontend to the backend. It is called automatically on an
+atomic update, as to disable the frontend by default (it will be enabled
+later on in the atomic update if necessary).
+
+It fixes an issue when enabling a layer that uses the frontend (e.g. for
+scaling) and then reusing the same layer without the frontend. Since the
+video channel to the frontend was never disabled, the backend was still
+trying to get data from there.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 8 ++++++++
+ drivers/gpu/drm/sun4i/sun4i_backend.h | 2 ++
+ drivers/gpu/drm/sun4i/sun4i_layer.c   | 2 ++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index de0a76dfa1a2..e6208d97578b 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -423,6 +423,14 @@ int sun4i_backend_update_layer_zpos(struct sun4i_backend *backend, int layer,
+ 	return 0;
+ }
+ 
++void sun4i_backend_disable_layer_frontend(struct sun4i_backend *backend,
++					  int layer)
++{
++	regmap_update_bits(backend->engine.regs,
++			   SUN4I_BACKEND_ATTCTL_REG0(layer),
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN, 0);
++}
++
+ static bool sun4i_backend_plane_uses_scaler(struct drm_plane_state *state)
+ {
+ 	u16 src_h = state->src_h >> 16;
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index 4caee0392fa4..d807efeea3d3 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -207,5 +207,7 @@ int sun4i_backend_update_layer_frontend(struct sun4i_backend *backend,
+ 					int layer, uint32_t in_fmt);
+ int sun4i_backend_update_layer_zpos(struct sun4i_backend *backend,
+ 				    int layer, struct drm_plane *plane);
++void sun4i_backend_disable_layer_frontend(struct sun4i_backend *backend,
++					  int layer);
+ 
+ #endif /* _SUN4I_BACKEND_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index 750ad24de1d7..e976cb9b4324 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -94,6 +94,8 @@ static void sun4i_backend_layer_atomic_update(struct drm_plane *plane,
+ 	struct sun4i_backend *backend = layer->backend;
+ 	struct sun4i_frontend *frontend = backend->frontend;
+ 
++	sun4i_backend_disable_layer_frontend(backend, layer->id);
++
+ 	if (layer_state->uses_frontend) {
+ 		sun4i_frontend_init(frontend);
+ 		sun4i_frontend_update_coord(frontend, plane);
+-- 
+2.18.0
+
+From cffde51cbb14ed3134bce517518122255d0ac913 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 14:28:16 +0100
+Subject: [PATCH 02/25] drm/sun4i: Disable YUV channel when using the frontend
+ and set interlace
+
+The YUV channel was only disabled in sun4i_backend_update_layer_formats,
+which is not called when the frontend is selected.
+
+Thus, creating a layer with a YUV format handled by the backend and then
+switching to a format that requires the frontend would keep the YUV
+channel enabled for the layer.
+
+This explicitly disables the YUV channel for the layer when using the
+frontend as well. It also sets the relevant interlace bit, which was
+missing in the frontend path as well.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 17 ++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun4i_backend.h |  3 ++-
+ drivers/gpu/drm/sun4i/sun4i_layer.c   |  2 +-
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index e6208d97578b..96b9f8b000ea 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -321,8 +321,10 @@ int sun4i_backend_update_layer_formats(struct sun4i_backend *backend,
+ }
+ 
+ int sun4i_backend_update_layer_frontend(struct sun4i_backend *backend,
+-					int layer, uint32_t fmt)
++					int layer, struct drm_plane *plane,
++					uint32_t fmt)
+ {
++	bool interlaced = false;
+ 	u32 val;
+ 	int ret;
+ 
+@@ -332,11 +334,24 @@ int sun4i_backend_update_layer_frontend(struct sun4i_backend *backend,
+ 		return ret;
+ 	}
+ 
++	/* Clear the YUV mode */
++	regmap_update_bits(backend->engine.regs,
++			   SUN4I_BACKEND_ATTCTL_REG0(layer),
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN, 0);
++
+ 	regmap_update_bits(backend->engine.regs,
+ 			   SUN4I_BACKEND_ATTCTL_REG0(layer),
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN,
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN);
+ 
++	if (plane->state->crtc)
++		interlaced = plane->state->crtc->state->adjusted_mode.flags
++			& DRM_MODE_FLAG_INTERLACE;
++
++	regmap_update_bits(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
++			   SUN4I_BACKEND_MODCTL_ITLMOD_EN,
++			   interlaced ? SUN4I_BACKEND_MODCTL_ITLMOD_EN : 0);
++
+ 	regmap_update_bits(backend->engine.regs,
+ 			   SUN4I_BACKEND_ATTCTL_REG1(layer),
+ 			   SUN4I_BACKEND_ATTCTL_REG1_LAY_FBFMT, val);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index d807efeea3d3..3c2ebb8cef30 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -204,7 +204,8 @@ int sun4i_backend_update_layer_formats(struct sun4i_backend *backend,
+ int sun4i_backend_update_layer_buffer(struct sun4i_backend *backend,
+ 				      int layer, struct drm_plane *plane);
+ int sun4i_backend_update_layer_frontend(struct sun4i_backend *backend,
+-					int layer, uint32_t in_fmt);
++					int layer, struct drm_plane *plane,
++					uint32_t fmt);
+ int sun4i_backend_update_layer_zpos(struct sun4i_backend *backend,
+ 				    int layer, struct drm_plane *plane);
+ void sun4i_backend_disable_layer_frontend(struct sun4i_backend *backend,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index e976cb9b4324..68a9576dd8bd 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -102,7 +102,7 @@ static void sun4i_backend_layer_atomic_update(struct drm_plane *plane,
+ 		sun4i_frontend_update_buffer(frontend, plane);
+ 		sun4i_frontend_update_formats(frontend, plane,
+ 					      DRM_FORMAT_ARGB8888);
+-		sun4i_backend_update_layer_frontend(backend, layer->id,
++		sun4i_backend_update_layer_frontend(backend, layer->id, plane,
+ 						    DRM_FORMAT_ARGB8888);
+ 		sun4i_frontend_enable(frontend);
+ 	} else {
+-- 
+2.18.0
+
+From d59d0ace8b6c52fb2e0011d36cd242ef604e6397 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 13 Mar 2018 11:27:26 +0100
+Subject: [PATCH 03/25] drm/sun4i: Don't pretend to handle ARGB8888 with the
+ frontend
+
+It turns out that the frontend is not capable of preserving the alpha
+component (that is always set to 0xff), so only support XRGB8888
+instead.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c  | 4 ++++
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 3 +--
+ drivers/gpu/drm/sun4i/sun4i_layer.c    | 4 ++--
+ 3 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 96b9f8b000ea..8aac6462ac57 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -468,6 +468,10 @@ static bool sun4i_backend_plane_uses_frontend(struct drm_plane_state *state)
+ 	if (IS_ERR(backend->frontend))
+ 		return false;
+ 
++	/*
++	 * TODO: Don't use the frontend for x2/x4 scaling and allow RGB formats
++	 * with an alpha component then.
++	 */
+ 	return sun4i_backend_plane_uses_scaler(state);
+ }
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index ddf6cfa6dd23..3ea925584891 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -107,7 +107,7 @@ EXPORT_SYMBOL(sun4i_frontend_update_buffer);
+ static int sun4i_frontend_drm_format_to_input_fmt(uint32_t fmt, u32 *val)
+ {
+ 	switch (fmt) {
+-	case DRM_FORMAT_ARGB8888:
++	case DRM_FORMAT_XRGB8888:
+ 		*val = 5;
+ 		return 0;
+ 
+@@ -120,7 +120,6 @@ static int sun4i_frontend_drm_format_to_output_fmt(uint32_t fmt, u32 *val)
+ {
+ 	switch (fmt) {
+ 	case DRM_FORMAT_XRGB8888:
+-	case DRM_FORMAT_ARGB8888:
+ 		*val = 2;
+ 		return 0;
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index 68a9576dd8bd..a84ac858a8f2 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -101,9 +101,9 @@ static void sun4i_backend_layer_atomic_update(struct drm_plane *plane,
+ 		sun4i_frontend_update_coord(frontend, plane);
+ 		sun4i_frontend_update_buffer(frontend, plane);
+ 		sun4i_frontend_update_formats(frontend, plane,
+-					      DRM_FORMAT_ARGB8888);
++					      DRM_FORMAT_XRGB8888);
+ 		sun4i_backend_update_layer_frontend(backend, layer->id, plane,
+-						    DRM_FORMAT_ARGB8888);
++						    DRM_FORMAT_XRGB8888);
+ 		sun4i_frontend_enable(frontend);
+ 	} else {
+ 		sun4i_backend_update_layer_formats(backend, layer->id, plane);
+-- 
+2.18.0
+
+From 799bd9aecf5f6671995c7e5a27f251157ff74b85 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 14:47:29 +0100
+Subject: [PATCH 04/25] drm/sun4i: Explicitly list and check formats supported
+ by the backend
+
+In order to check whether the backend supports a specific format, an
+explicit list and a related helper are introduced.
+
+They are then used to determine whether the frontend should be used for
+a layer, when the format is not supported by the backend.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 48 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun4i_backend.h |  1 +
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 8aac6462ac57..d85be1c12a6d 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -184,6 +184,39 @@ static int sun4i_backend_drm_format_to_layer(u32 format, u32 *mode)
+ 	return 0;
+ }
+ 
++static const uint32_t sun4i_backend_formats[] = {
++	/* RGB */
++	DRM_FORMAT_ARGB4444,
++	DRM_FORMAT_RGBA4444,
++	DRM_FORMAT_ARGB1555,
++	DRM_FORMAT_RGBA5551,
++	DRM_FORMAT_RGB565,
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_ARGB8888,
++	/* YUV422 */
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_VYUY,
++};
++
++bool sun4i_backend_format_is_supported(uint32_t fmt)
++{
++	bool found = false;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(sun4i_backend_formats); i++) {
++		if (sun4i_backend_formats[i] == fmt) {
++			found = true;
++			break;
++		}
++	}
++
++	return found;
++}
++
+ int sun4i_backend_update_layer_coord(struct sun4i_backend *backend,
+ 				     int layer, struct drm_plane *plane)
+ {
+@@ -464,15 +497,28 @@ static bool sun4i_backend_plane_uses_frontend(struct drm_plane_state *state)
+ {
+ 	struct sun4i_layer *layer = plane_to_sun4i_layer(state->plane);
+ 	struct sun4i_backend *backend = layer->backend;
++	struct drm_framebuffer *fb = state->fb;
+ 
+ 	if (IS_ERR(backend->frontend))
+ 		return false;
+ 
++	/*
++	 * Let's pretend that every format is either supported by the backend or
++	 * the frontend. This is not true in practice, as some tiling modes are
++	 * not supported by either. There is still room to check this later in
++	 * the atomic check process.
++	 */
++	if (!sun4i_backend_format_is_supported(fb->format->format))
++		return true;
++
+ 	/*
+ 	 * TODO: Don't use the frontend for x2/x4 scaling and allow RGB formats
+ 	 * with an alpha component then.
+ 	 */
+-	return sun4i_backend_plane_uses_scaler(state);
++	if (sun4i_backend_plane_uses_scaler(state))
++		return true;
++
++	return false;
+ }
+ 
+ static void sun4i_backend_atomic_begin(struct sunxi_engine *engine,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index 3c2ebb8cef30..f82bdb34da56 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -210,5 +210,6 @@ int sun4i_backend_update_layer_zpos(struct sun4i_backend *backend,
+ 				    int layer, struct drm_plane *plane);
+ void sun4i_backend_disable_layer_frontend(struct sun4i_backend *backend,
+ 					  int layer);
++bool sun4i_backend_format_is_supported(uint32_t fmt);
+ 
+ #endif /* _SUN4I_BACKEND_H_ */
+-- 
+2.18.0
+
+From 51e83ff1f1109829ba0c78d21b78a3f47a60626c Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:00:06 +0100
+Subject: [PATCH 05/25] drm/sun4i: Explicitly list and check formats supported
+ by the frontend
+
+In order to check whether the frontend supports a specific format, an
+explicit list and a related helper are introduced.
+
+They are then used to determine whether the frontend can actually support
+the requested format when it was selected to be used.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c  |  5 +++
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 44 ++++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  1 +
+ 3 files changed, 50 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index d85be1c12a6d..9e4224ca8298 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -560,6 +560,11 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 		struct drm_format_name_buf format_name;
+ 
+ 		if (sun4i_backend_plane_uses_frontend(plane_state)) {
++			if (!sun4i_frontend_format_is_supported(fb->format->format)) {
++				DRM_DEBUG_DRIVER("Frontend plane check failed\n");
++				return -EINVAL;
++			}
++
+ 			DRM_DEBUG_DRIVER("Using the frontend for plane %d\n",
+ 					 plane->index);
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 3ea925584891..2dc33383be22 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -128,6 +128,50 @@ static int sun4i_frontend_drm_format_to_output_fmt(uint32_t fmt, u32 *val)
+ 	}
+ }
+ 
++static const uint32_t sun4i_frontend_formats[] = {
++	/* RGB */
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_BGRX8888,
++	/* YUV444 */
++	DRM_FORMAT_YUV444,
++	DRM_FORMAT_YVU444,
++	/* YUV422 */
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_VYUY,
++	DRM_FORMAT_NV16,
++	DRM_FORMAT_NV61,
++	DRM_FORMAT_YUV422,
++	DRM_FORMAT_YVU422,
++	/* YUV420 */
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_YVU420,
++	/* YUV411 */
++	DRM_FORMAT_YUV411,
++	DRM_FORMAT_YVU411,
++};
++
++bool sun4i_frontend_format_is_supported(uint32_t fmt)
++{
++	bool found = false;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(sun4i_frontend_formats); i++) {
++		if (sun4i_frontend_formats[i] == fmt) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found)
++		return false;
++
++	return true;
++}
++
+ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				  struct drm_plane *plane, uint32_t out_fmt)
+ {
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 02661ce81f3e..a9cb908ced16 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -95,5 +95,6 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ 				 struct drm_plane *plane);
+ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				  struct drm_plane *plane, uint32_t out_fmt);
++bool sun4i_frontend_format_is_supported(uint32_t fmt);
+ 
+ #endif /* _SUN4I_FRONTEND_H_ */
+-- 
+2.18.0
+
+From 30add69fbaa19eb55a9b3cef174065bfb1a07618 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:07:52 +0100
+Subject: [PATCH 06/25] drm/sun4i: Move and extend format-related helpers and
+ tables
+
+This moves the various helpers and tables related to format detection
+and conversion to a dedicated file, while adding a bunch of new helpers
+(especially for YUV and tiling support) along the way.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/Makefile        |   1 +
+ drivers/gpu/drm/sun4i/sun4i_backend.c |  65 +-------
+ drivers/gpu/drm/sun4i/sun4i_format.c  | 205 ++++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun4i_format.h  |  35 +++++
+ 4 files changed, 246 insertions(+), 60 deletions(-)
+ create mode 100644 drivers/gpu/drm/sun4i/sun4i_format.c
+ create mode 100644 drivers/gpu/drm/sun4i/sun4i_format.h
+
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 2589f4acd5ae..264bf657e6a1 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -4,6 +4,7 @@ sun4i-frontend-y		+= sun4i_frontend.o
+ 
+ sun4i-drm-y			+= sun4i_drv.o
+ sun4i-drm-y			+= sun4i_framebuffer.o
++sun4i-drm-y			+= sun4i_format.o
+ 
+ sun4i-drm-hdmi-y		+= sun4i_hdmi_ddc_clk.o
+ sun4i-drm-hdmi-y		+= sun4i_hdmi_enc.o
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 9e4224ca8298..3f779907389d 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -29,6 +29,7 @@
+ #include "sun4i_drv.h"
+ #include "sun4i_frontend.h"
+ #include "sun4i_layer.h"
++#include "sun4i_format.h"
+ #include "sunxi_engine.h"
+ 
+ struct sun4i_backend_quirks {
+@@ -36,62 +37,6 @@ struct sun4i_backend_quirks {
+ 	bool needs_output_muxing;
+ };
+ 
+-static const u32 sunxi_rgb2yuv_coef[12] = {
+-	0x00000107, 0x00000204, 0x00000064, 0x00000108,
+-	0x00003f69, 0x00003ed6, 0x000001c1, 0x00000808,
+-	0x000001c1, 0x00003e88, 0x00003fb8, 0x00000808
+-};
+-
+-/*
+- * These coefficients are taken from the A33 BSP from Allwinner.
+- *
+- * The formula is for each component, each coefficient being multiplied by
+- * 1024 and each constant being multiplied by 16:
+- * G = 1.164 * Y - 0.391 * U - 0.813 * V + 135
+- * R = 1.164 * Y + 1.596 * V - 222
+- * B = 1.164 * Y + 2.018 * U + 276
+- *
+- * This seems to be a conversion from Y[16:235] UV[16:240] to RGB[0:255],
+- * following the BT601 spec.
+- */
+-static const u32 sunxi_bt601_yuv2rgb_coef[12] = {
+-	0x000004a7, 0x00001e6f, 0x00001cbf, 0x00000877,
+-	0x000004a7, 0x00000000, 0x00000662, 0x00003211,
+-	0x000004a7, 0x00000812, 0x00000000, 0x00002eb1,
+-};
+-
+-static inline bool sun4i_backend_format_is_planar_yuv(uint32_t format)
+-{
+-	switch (format) {
+-	case DRM_FORMAT_YUV411:
+-	case DRM_FORMAT_YUV422:
+-	case DRM_FORMAT_YUV444:
+-		return true;
+-	default:
+-		return false;
+-	}
+-}
+-
+-static inline bool sun4i_backend_format_is_packed_yuv422(uint32_t format)
+-{
+-	switch (format) {
+-	case DRM_FORMAT_YUYV:
+-	case DRM_FORMAT_YVYU:
+-	case DRM_FORMAT_UYVY:
+-	case DRM_FORMAT_VYUY:
+-		return true;
+-
+-	default:
+-		return false;
+-	}
+-}
+-
+-static inline bool sun4i_backend_format_is_yuv(uint32_t format)
+-{
+-	return sun4i_backend_format_is_planar_yuv(format) ||
+-		sun4i_backend_format_is_packed_yuv422(format);
+-}
+-
+ static void sun4i_backend_apply_color_correction(struct sunxi_engine *engine)
+ {
+ 	int i;
+@@ -272,7 +217,7 @@ static int sun4i_backend_update_yuv_format(struct sun4i_backend *backend,
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN);
+ 
+ 	/* TODO: Add support for the multi-planar YUV formats */
+-	if (sun4i_backend_format_is_packed_yuv422(format))
++	if (sun4i_format_is_packed_yuv422(format))
+ 		val |= SUN4I_BACKEND_IYUVCTL_FBFMT_PACKED_YUV422;
+ 	else
+ 		DRM_DEBUG_DRIVER("Unsupported YUV format (0x%x)\n", format);
+@@ -337,7 +282,7 @@ int sun4i_backend_update_layer_formats(struct sun4i_backend *backend,
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN,
+ 			   val);
+ 
+-	if (sun4i_backend_format_is_yuv(fb->format->format))
++	if (sun4i_format_is_yuv(fb->format->format))
+ 		return sun4i_backend_update_yuv_format(backend, layer, plane);
+ 
+ 	ret = sun4i_backend_drm_format_to_layer(fb->format->format, &val);
+@@ -432,7 +377,7 @@ int sun4i_backend_update_layer_buffer(struct sun4i_backend *backend,
+ 	 */
+ 	paddr -= PHYS_OFFSET;
+ 
+-	if (sun4i_backend_format_is_yuv(fb->format->format))
++	if (sun4i_format_is_yuv(fb->format->format))
+ 		return sun4i_backend_update_yuv_buffer(backend, fb, paddr);
+ 
+ 	/* Write the 32 lower bits of the address (in bits) */
+@@ -580,7 +525,7 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 		if (fb->format->has_alpha || (plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
+ 			num_alpha_planes++;
+ 
+-		if (sun4i_backend_format_is_yuv(fb->format->format)) {
++		if (sun4i_format_is_yuv(fb->format->format)) {
+ 			DRM_DEBUG_DRIVER("Plane FB format is YUV\n");
+ 			num_yuv_planes++;
+ 		}
+diff --git a/drivers/gpu/drm/sun4i/sun4i_format.c b/drivers/gpu/drm/sun4i/sun4i_format.c
+new file mode 100644
+index 000000000000..9f41d3c41085
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun4i_format.c
+@@ -0,0 +1,205 @@
++/*
++ * Copyright (C) 2015-2018 Free Electrons/Bootlin
++ *
++ * Maxime Ripard <maxime.ripard@bootlin.com>
++ * Paul Kocialkowski <paul.kocialkowski@bootlin.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ */
++
++#include <linux/component.h>
++#include <linux/kfifo.h>
++#include <linux/of_graph.h>
++#include <linux/of_reserved_mem.h>
++
++#include <drm/drmP.h>
++#include <drm/drm_crtc_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <drm/drm_fb_helper.h>
++#include <drm/drm_of.h>
++
++#include "sun4i_drv.h"
++#include "sun4i_format.h"
++
++const u32 sunxi_rgb2yuv_coef[12] = {
++	0x00000107, 0x00000204, 0x00000064, 0x00000108,
++	0x00003f69, 0x00003ed6, 0x000001c1, 0x00000808,
++	0x000001c1, 0x00003e88, 0x00003fb8, 0x00000808
++};
++
++/*
++ * These coefficients are taken from the A33 BSP from Allwinner.
++ *
++ * The formula is for each component, each coefficient being multiplied by
++ * 1024 and each constant being multiplied by 16:
++ * G = 1.164 * Y - 0.391 * U - 0.813 * V + 135
++ * R = 1.164 * Y + 1.596 * V - 222
++ * B = 1.164 * Y + 2.018 * U + 276
++ *
++ * This seems to be a conversion from Y[16:235] UV[16:240] to RGB[0:255],
++ * following the BT601 spec.
++ */
++const u32 sunxi_bt601_yuv2rgb_coef[12] = {
++	0x000004a7, 0x00001e6f, 0x00001cbf, 0x00000877,
++	0x000004a7, 0x00000000, 0x00000662, 0x00003211,
++	0x000004a7, 0x00000812, 0x00000000, 0x00002eb1,
++};
++
++bool sun4i_format_is_rgb(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_ARGB4444:
++	case DRM_FORMAT_RGBA4444:
++	case DRM_FORMAT_ARGB1555:
++	case DRM_FORMAT_RGBA5551:
++	case DRM_FORMAT_RGB888:
++	case DRM_FORMAT_RGB565:
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_ARGB8888:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_yuv(uint32_t format)
++{
++	return sun4i_format_is_yuv411(format) ||
++	       sun4i_format_is_yuv420(format) ||
++	       sun4i_format_is_yuv422(format) ||
++	       sun4i_format_is_yuv444(format);
++}
++
++bool sun4i_format_is_yuv411(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_yuv420(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_yuv422(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_YVYU:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_yuv444(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV444:
++	case DRM_FORMAT_YVU444:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_packed(uint32_t format)
++{
++	if (sun4i_format_is_rgb(format))
++		return true;
++
++	switch (format) {
++	case DRM_FORMAT_YUYV:
++	case DRM_FORMAT_YVYU:
++	case DRM_FORMAT_UYVY:
++	case DRM_FORMAT_VYUY:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_semiplanar(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++	case DRM_FORMAT_NV24:
++	case DRM_FORMAT_NV42:
++		return true;
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_is_planar(uint32_t format)
++{
++	switch (format) {
++	case DRM_FORMAT_YUV410:
++	case DRM_FORMAT_YVU410:
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV444:
++	case DRM_FORMAT_YVU444:
++		return true;
++	default:
++		return false;
++	}
++}
++
++bool sun4i_format_supports_tiling(uint32_t format)
++{
++	switch (format) {
++	/* Semiplanar */
++	case DRM_FORMAT_NV12:
++	case DRM_FORMAT_NV21:
++	case DRM_FORMAT_NV16:
++	case DRM_FORMAT_NV61:
++	/* Planar */
++	case DRM_FORMAT_YUV420:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YUV422:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YUV411:
++	case DRM_FORMAT_YVU411:
++		return true;
++
++	default:
++		return false;
++	}
++}
+diff --git a/drivers/gpu/drm/sun4i/sun4i_format.h b/drivers/gpu/drm/sun4i/sun4i_format.h
+new file mode 100644
+index 000000000000..1d6364cd3681
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun4i_format.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2015-2018 Free Electrons/Bootlin
++ *
++ * Maxime Ripard <maxime.ripard@bootlin.com>
++ * Paul Kocialkowski <paul.kocialkowski@bootlin.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ */
++
++#ifndef _SUN4I_FORMAT_H_
++#define _SUN4I_FORMAT_H_
++
++extern const u32 sunxi_rgb2yuv_coef[12];
++extern const u32 sunxi_bt601_yuv2rgb_coef[12];
++
++bool sun4i_format_is_rgb(uint32_t format);
++bool sun4i_format_is_yuv(uint32_t format);
++bool sun4i_format_is_yuv411(uint32_t format);
++bool sun4i_format_is_yuv420(uint32_t format);
++bool sun4i_format_is_yuv422(uint32_t format);
++bool sun4i_format_is_yuv444(uint32_t format);
++bool sun4i_format_is_packed(uint32_t format);
++bool sun4i_format_is_semiplanar(uint32_t format);
++bool sun4i_format_is_planar(uint32_t format);
++bool sun4i_format_supports_tiling(uint32_t format);
++
++static inline bool sun4i_format_is_packed_yuv422(uint32_t format)
++{
++	return sun4i_format_is_packed(format) && sun4i_format_is_yuv422(format);
++}
++
++#endif /* _SUN4I_FORMAT_H_ */
+-- 
+2.18.0
+
+From 2510ce048174b45cd73a7e15b4244e9e07829922 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:26:31 +0100
+Subject: [PATCH 07/25] drm/sun4i: Add support for YUV formats through the
+ frontend
+
+The frontend supports many YUV formats as input and also contains a
+color-space converter (CSC) block that can convert YUV input into
+RGB output. It also allows scaling between the input and output for
+every possible combination of supported formats.
+
+This adds support for all the (untiled) YUV video formats supported by
+the frontend, with associated changes in the backend and layer
+management.
+
+A specific dumb GEM create function translates a hardware constraint,
+that the stride must be an even number, when allocating dumb (linear)
+buffers.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c  |  10 +-
+ drivers/gpu/drm/sun4i/sun4i_drv.c      |  11 +-
+ drivers/gpu/drm/sun4i/sun4i_drv.h      |   4 +
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 234 +++++++++++++++++++++----
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  48 ++++-
+ drivers/gpu/drm/sun4i/sun4i_layer.c    |  34 +++-
+ 6 files changed, 293 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 3f779907389d..450e0345337c 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -516,6 +516,11 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 			layer_state->uses_frontend = true;
+ 			num_frontend_planes++;
+ 		} else {
++			if (sun4i_format_is_yuv(fb->format->format)) {
++				DRM_DEBUG_DRIVER("Plane FB format is YUV\n");
++				num_yuv_planes++;
++			}
++
+ 			layer_state->uses_frontend = false;
+ 		}
+ 
+@@ -525,11 +530,6 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 		if (fb->format->has_alpha || (plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
+ 			num_alpha_planes++;
+ 
+-		if (sun4i_format_is_yuv(fb->format->format)) {
+-			DRM_DEBUG_DRIVER("Plane FB format is YUV\n");
+-			num_yuv_planes++;
+-		}
+-
+ 		DRM_DEBUG_DRIVER("Plane zpos is %d\n",
+ 				 plane_state->normalized_zpos);
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index 50d19605c38f..00b0e9dabb77 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -42,7 +42,7 @@ static struct drm_driver sun4i_drv_driver = {
+ 	.minor			= 0,
+ 
+ 	/* GEM Operations */
+-	.dumb_create		= drm_gem_cma_dumb_create,
++	.dumb_create		= drm_sun4i_gem_dumb_create,
+ 	.gem_free_object_unlocked = drm_gem_cma_free_object,
+ 	.gem_vm_ops		= &drm_gem_cma_vm_ops,
+ 
+@@ -60,6 +60,15 @@ static struct drm_driver sun4i_drv_driver = {
+ 	/* Frame Buffer Operations */
+ };
+ 
++int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
++			      struct drm_device *drm,
++			      struct drm_mode_create_dumb *args)
++{
++	args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), 2);
++
++	return drm_gem_cma_dumb_create_internal(file_priv, drm, args);
++}
++
+ static void sun4i_remove_framebuffers(void)
+ {
+ 	struct apertures_struct *ap;
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.h b/drivers/gpu/drm/sun4i/sun4i_drv.h
+index 5750b8ce8b31..47969711a889 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.h
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.h
+@@ -23,4 +23,8 @@ struct sun4i_drv {
+ 	struct list_head	tcon_list;
+ };
+ 
++int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
++			      struct drm_device *drm,
++			      struct drm_mode_create_dumb *args);
++
+ #endif /* _SUN4I_DRV_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 2dc33383be22..d9e58e96119c 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -16,6 +16,7 @@
+ #include <linux/reset.h>
+ 
+ #include "sun4i_drv.h"
++#include "sun4i_format.h"
+ #include "sun4i_frontend.h"
+ 
+ static const u32 sun4i_frontend_vert_coef[32] = {
+@@ -89,26 +90,135 @@ void sun4i_frontend_update_buffer(struct sun4i_frontend *frontend,
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
++	uint32_t format = fb->format->format;
++	uint32_t width, height;
++	uint32_t stride, offset;
++	bool swap;
+ 	dma_addr_t paddr;
+ 
+-	/* Set the line width */
+-	DRM_DEBUG_DRIVER("Frontend stride: %d bytes\n", fb->pitches[0]);
++	width = state->src_w >> 16;
++	height = state->src_h >> 16;
++
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD0_REG,
+ 		     fb->pitches[0]);
+ 
++	if (drm_format_num_planes(format) > 1)
++		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD1_REG,
++			     fb->pitches[1]);
++
++	if (drm_format_num_planes(format) > 2)
++		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD2_REG,
++			     fb->pitches[2]);
++
+ 	/* Set the physical address of the buffer in memory */
+ 	paddr = drm_fb_cma_get_gem_addr(fb, state, 0);
+ 	paddr -= PHYS_OFFSET;
+-	DRM_DEBUG_DRIVER("Setting buffer address to %pad\n", &paddr);
++	DRM_DEBUG_DRIVER("Setting buffer #0 address to %pad\n", &paddr);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR0_REG, paddr);
++
++	/* Some planar formats require chroma channel swapping by hand. */
++	swap = sun4i_frontend_format_chroma_requires_swap(format);
++
++	if (drm_format_num_planes(format) > 1) {
++		paddr = drm_fb_cma_get_gem_addr(fb, state, swap ? 2 : 1);
++		paddr -= PHYS_OFFSET;
++		DRM_DEBUG_DRIVER("Setting buffer #1 address to %pad\n", &paddr);
++		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR1_REG,
++			     paddr);
++	}
++
++	if (drm_format_num_planes(format) > 2) {
++		paddr = drm_fb_cma_get_gem_addr(fb, state, swap ? 1 : 2);
++		paddr -= PHYS_OFFSET;
++		DRM_DEBUG_DRIVER("Setting buffer #2 address to %pad\n", &paddr);
++		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR2_REG,
++			     paddr);
++	}
+ }
+ EXPORT_SYMBOL(sun4i_frontend_update_buffer);
+ 
+ static int sun4i_frontend_drm_format_to_input_fmt(uint32_t fmt, u32 *val)
+ {
++	if (sun4i_format_is_rgb(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_RGB;
++	else if (sun4i_format_is_yuv411(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV411;
++	else if (sun4i_format_is_yuv420(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV420;
++	else if (sun4i_format_is_yuv422(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV422;
++	else if (sun4i_format_is_yuv444(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV444;
++	else
++		return -EINVAL;
++
++	return 0;
++}
++
++static int sun4i_frontend_drm_format_to_input_mode(uint32_t fmt, u32 *val)
++{
++	if (sun4i_format_is_packed(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PACKED;
++	else if (sun4i_format_is_semiplanar(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_SEMIPLANAR;
++	else if (sun4i_format_is_planar(fmt))
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PLANAR;
++	else
++		return -EINVAL;
++
++	return 0;
++}
++
++static int sun4i_frontend_drm_format_to_input_sequence(uint32_t fmt, u32 *val)
++{
++	/* Planar formats have an explicit input sequence. */
++	if (sun4i_format_is_planar(fmt)) {
++		*val = 0;
++		return 0;
++	}
++
+ 	switch (fmt) {
++	/* RGB */
+ 	case DRM_FORMAT_XRGB8888:
+-		*val = 5;
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_XRGB;
++		return 0;
++
++	case DRM_FORMAT_BGRX8888:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_BGRX;
++		return 0;
++
++	/* YUV420 */
++	case DRM_FORMAT_NV12:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UV;
++		return 0;
++
++	case DRM_FORMAT_NV21:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VU;
++		return 0;
++
++	/* YUV422 */
++	case DRM_FORMAT_YUYV:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_YUYV;
++		return 0;
++
++	case DRM_FORMAT_VYUY:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VYUY;
++		return 0;
++
++	case DRM_FORMAT_YVYU:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_YVYU;
++		return 0;
++
++	case DRM_FORMAT_UYVY:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UYVY;
++		return 0;
++
++	case DRM_FORMAT_NV16:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UV;
++		return 0;
++
++	case DRM_FORMAT_NV61:
++		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VU;
+ 		return 0;
+ 
+ 	default:
+@@ -120,7 +230,11 @@ static int sun4i_frontend_drm_format_to_output_fmt(uint32_t fmt, u32 *val)
+ {
+ 	switch (fmt) {
+ 	case DRM_FORMAT_XRGB8888:
+-		*val = 2;
++		*val = SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT_XRGB8888;
++		return 0;
++
++	case DRM_FORMAT_BGRX8888:
++		*val = SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT_BGRX8888;
+ 		return 0;
+ 
+ 	default:
+@@ -172,22 +286,52 @@ bool sun4i_frontend_format_is_supported(uint32_t fmt)
+ 	return true;
+ }
+ 
++bool sun4i_frontend_format_chroma_requires_swap(uint32_t fmt)
++{
++	switch (fmt) {
++	case DRM_FORMAT_YVU444:
++	case DRM_FORMAT_YVU422:
++	case DRM_FORMAT_YVU420:
++	case DRM_FORMAT_YVU411:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
+ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				  struct drm_plane *plane, uint32_t out_fmt)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
++	uint32_t format = fb->format->format;
+ 	u32 out_fmt_val;
+ 	u32 in_fmt_val;
++	u32 in_mod_val;
++	u32 in_ps_val;
++	u32 bypass;
++	unsigned int i;
+ 	int ret;
+ 
+-	ret = sun4i_frontend_drm_format_to_input_fmt(fb->format->format,
+-						     &in_fmt_val);
++	ret = sun4i_frontend_drm_format_to_input_fmt(format, &in_fmt_val);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Invalid input format\n");
+ 		return ret;
+ 	}
+ 
++	ret = sun4i_frontend_drm_format_to_input_mode(format, &in_mod_val);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Invalid input mode\n");
++		return ret;
++	}
++
++	ret = sun4i_frontend_drm_format_to_input_sequence(format, &in_ps_val);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Invalid pixel sequence\n");
++		return ret;
++	}
++
+ 	ret = sun4i_frontend_drm_format_to_output_fmt(out_fmt, &out_fmt_val);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Invalid output format\n");
+@@ -205,10 +349,30 @@ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTPHASE1_REG, 0x400);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTPHASE1_REG, 0x400);
+ 
++	if (sun4i_format_is_yuv(format) &&
++	    !sun4i_format_is_yuv(out_fmt)) {
++		/* Setup the CSC engine for YUV to RGB conversion. */
++
++		for (i = 0; i < ARRAY_SIZE(sunxi_bt601_yuv2rgb_coef); i++)
++			regmap_write(frontend->regs,
++				     SUN4I_FRONTEND_CSC_COEF_REG(i),
++				     sunxi_bt601_yuv2rgb_coef[i]);
++
++		regmap_update_bits(frontend->regs,
++				   SUN4I_FRONTEND_FRM_CTRL_REG,
++				   SUN4I_FRONTEND_FRM_CTRL_COEF_RDY,
++				   SUN4I_FRONTEND_FRM_CTRL_COEF_RDY);
++
++		bypass = 0;
++	} else {
++		bypass = SUN4I_FRONTEND_BYPASS_CSC_EN;
++	}
++
++	regmap_update_bits(frontend->regs, SUN4I_FRONTEND_BYPASS_REG,
++			   SUN4I_FRONTEND_BYPASS_CSC_EN, bypass);
++
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_INPUT_FMT_REG,
+-		     SUN4I_FRONTEND_INPUT_FMT_DATA_MOD(1) |
+-		     SUN4I_FRONTEND_INPUT_FMT_DATA_FMT(in_fmt_val) |
+-		     SUN4I_FRONTEND_INPUT_FMT_PS(1));
++		     in_mod_val | in_fmt_val | in_ps_val);
+ 
+ 	/*
+ 	 * TODO: It look like the A31 and A80 at least will need the
+@@ -216,7 +380,7 @@ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 	 * ARGB8888).
+ 	 */
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_OUTPUT_FMT_REG,
+-		     SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT(out_fmt_val));
++		     out_fmt_val);
+ 
+ 	return 0;
+ }
+@@ -226,31 +390,45 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ 				 struct drm_plane *plane)
+ {
+ 	struct drm_plane_state *state = plane->state;
++	struct drm_framebuffer *fb = state->fb;
++	uint32_t format = fb->format->format;
++	uint32_t luma_width, luma_height;
++	uint32_t chroma_width, chroma_height;
+ 
+ 	/* Set height and width */
+-	DRM_DEBUG_DRIVER("Frontend size W: %u H: %u\n",
++	DRM_DEBUG_DRIVER("Frontend crtc size W: %u H: %u\n",
+ 			 state->crtc_w, state->crtc_h);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_INSIZE_REG,
+-		     SUN4I_FRONTEND_INSIZE(state->src_h >> 16,
+-					   state->src_w >> 16));
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_INSIZE_REG,
+-		     SUN4I_FRONTEND_INSIZE(state->src_h >> 16,
+-					   state->src_w >> 16));
+ 
++	luma_width = chroma_width = state->src_w >> 16;
++	luma_height = chroma_height = state->src_h >> 16;
++
++	if (sun4i_format_is_yuv411(format)) {
++		chroma_width = DIV_ROUND_UP(luma_width, 4);
++	} else if (sun4i_format_is_yuv420(format)) {
++		chroma_width = DIV_ROUND_UP(luma_width, 2);
++		chroma_height = DIV_ROUND_UP(luma_height, 2);
++	} else if (sun4i_format_is_yuv422(format)) {
++		chroma_width = DIV_ROUND_UP(luma_width, 2);
++	}
++
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_INSIZE_REG,
++		     SUN4I_FRONTEND_INSIZE(luma_height, luma_width));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_OUTSIZE_REG,
+ 		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h, state->crtc_w));
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZFACT_REG,
++		     (luma_width << 16) / state->crtc_w);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTFACT_REG,
++		     (luma_height << 16) / state->crtc_h);
++
++	/* These also have to be specified, even for interleaved formats. */
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_INSIZE_REG,
++		     SUN4I_FRONTEND_INSIZE(chroma_height, chroma_width));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_OUTSIZE_REG,
+ 		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h, state->crtc_w));
+-
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZFACT_REG,
+-		     state->src_w / state->crtc_w);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_HORZFACT_REG,
+-		     state->src_w / state->crtc_w);
+-
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTFACT_REG,
+-		     state->src_h / state->crtc_h);
++		     (chroma_width << 16) / state->crtc_w);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTFACT_REG,
+-		     state->src_h / state->crtc_h);
++		     (chroma_height << 16) / state->crtc_h);
+ 
+ 	regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
+ 			  SUN4I_FRONTEND_FRM_CTRL_REG_RDY,
+@@ -382,10 +560,6 @@ static int sun4i_frontend_runtime_resume(struct device *dev)
+ 			   SUN4I_FRONTEND_EN_EN,
+ 			   SUN4I_FRONTEND_EN_EN);
+ 
+-	regmap_update_bits(frontend->regs, SUN4I_FRONTEND_BYPASS_REG,
+-			   SUN4I_FRONTEND_BYPASS_CSC_EN,
+-			   SUN4I_FRONTEND_BYPASS_CSC_EN);
+-
+ 	sun4i_frontend_scaler_init(frontend);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index a9cb908ced16..6dd1d18752f4 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -21,17 +21,56 @@
+ #define SUN4I_FRONTEND_BYPASS_REG		0x008
+ #define SUN4I_FRONTEND_BYPASS_CSC_EN			BIT(1)
+ 
++#define SUN4I_FRONTEND_AGTH_SEL_REG		0x00C
++#define SUN4I_FRONTEND_AGTH_SEL_ORIGINAL		BIT(8)
++
+ #define SUN4I_FRONTEND_BUF_ADDR0_REG		0x020
++#define SUN4I_FRONTEND_BUF_ADDR1_REG		0x024
++#define SUN4I_FRONTEND_BUF_ADDR2_REG		0x028
++
++#define SUN4I_FRONTEND_TB_OFF0_REG		0x030
++#define SUN4I_FRONTEND_TB_OFF1_REG		0x034
++#define SUN4I_FRONTEND_TB_OFF2_REG		0x038
++
++#define SUN4I_FRONTEND_TB_OFF_X1(x1)			((x1) << 16)
++#define SUN4I_FRONTEND_TB_OFF_Y0(y0)			((y0) << 8)
++#define SUN4I_FRONTEND_TB_OFF_X0(x0)			(x0)
+ 
+ #define SUN4I_FRONTEND_LINESTRD0_REG		0x040
++#define SUN4I_FRONTEND_LINESTRD1_REG		0x044
++#define SUN4I_FRONTEND_LINESTRD2_REG		0x048
+ 
+ #define SUN4I_FRONTEND_INPUT_FMT_REG		0x04c
+-#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD(mod)		((mod) << 8)
+-#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT(fmt)		((fmt) << 4)
+-#define SUN4I_FRONTEND_INPUT_FMT_PS(ps)			(ps)
++
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_MASK			GENMASK(10, 8)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PLANAR		(0 << 8)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PACKED		(1 << 8)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_SEMIPLANAR		(2 << 8)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_MB32_PLANAR		(4 << 8)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_MB32_SEMIPLANAR	(6 << 8)
++
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_MASK			GENMASK(6, 4)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV444		(0 << 4)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV422		(1 << 4)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV420		(2 << 4)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_YUV411		(3 << 4)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_FMT_RGB			(5 << 4)
++
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_MASK			GENMASK(1, 0)
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UYVY			0
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_YUYV			1
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VYUY			2
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_YVYU			3
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UV			0
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VU			1
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_XRGB			0
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_BGRX			1
+ 
+ #define SUN4I_FRONTEND_OUTPUT_FMT_REG		0x05c
+-#define SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT(fmt)		(fmt)
++#define SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT_BGRX8888	1
++#define SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT_XRGB8888	2
++
++#define SUN4I_FRONTEND_CSC_COEF_REG(c)		(0x070 + (0x4 * (c)))
+ 
+ #define SUN4I_FRONTEND_CH0_INSIZE_REG		0x100
+ #define SUN4I_FRONTEND_INSIZE(h, w)			((((h) - 1) << 16) | (((w) - 1)))
+@@ -96,5 +135,6 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				  struct drm_plane *plane, uint32_t out_fmt);
+ bool sun4i_frontend_format_is_supported(uint32_t fmt);
++bool sun4i_frontend_format_chroma_requires_swap(uint32_t fmt);
+ 
+ #endif /* _SUN4I_FRONTEND_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index a84ac858a8f2..d70057c52f95 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -129,19 +129,37 @@ static const struct drm_plane_funcs sun4i_backend_layer_funcs = {
+ 	.update_plane		= drm_atomic_helper_update_plane,
+ };
+ 
+-static const uint32_t sun4i_backend_layer_formats[] = {
+-	DRM_FORMAT_ARGB8888,
++static const uint32_t sun4i_layer_formats[] = {
++	/* RGB */
+ 	DRM_FORMAT_ARGB4444,
++	DRM_FORMAT_RGBA4444,
+ 	DRM_FORMAT_ARGB1555,
+ 	DRM_FORMAT_RGBA5551,
+-	DRM_FORMAT_RGBA4444,
+-	DRM_FORMAT_RGB888,
+ 	DRM_FORMAT_RGB565,
+-	DRM_FORMAT_UYVY,
+-	DRM_FORMAT_VYUY,
++	DRM_FORMAT_RGB888,
+ 	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_ARGB8888,
++	/* YUV444 */
++	DRM_FORMAT_YUV444,
++	DRM_FORMAT_YVU444,
++	/* YUV422 */
+ 	DRM_FORMAT_YUYV,
+ 	DRM_FORMAT_YVYU,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_VYUY,
++	DRM_FORMAT_NV16,
++	DRM_FORMAT_NV61,
++	DRM_FORMAT_YUV422,
++	DRM_FORMAT_YVU422,
++	/* YUV420 */
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_YVU420,
++	/* YUV411 */
++	DRM_FORMAT_YUV411,
++	DRM_FORMAT_YVU411,
+ };
+ 
+ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+@@ -158,8 +176,8 @@ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 	/* possible crtcs are set later */
+ 	ret = drm_universal_plane_init(drm, &layer->plane, 0,
+ 				       &sun4i_backend_layer_funcs,
+-				       sun4i_backend_layer_formats,
+-				       ARRAY_SIZE(sun4i_backend_layer_formats),
++				       sun4i_layer_formats,
++				       ARRAY_SIZE(sun4i_layer_formats),
+ 				       NULL, type, NULL);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't initialize layer\n");
+-- 
+2.18.0
+
+From 7322f4126714c02d6f7e327f3061012838a42f34 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:39:29 +0100
+Subject: [PATCH 08/25] drm/fourcc: Add definitions for Allwinner vendor and
+ MB32 tiled format
+
+This introduces specific definitions for vendor Allwinner and its
+specific MB32 tiled format, an NV12-based format with 32x32 tiles.
+
+This format is the default output format used by the VPU on most
+Allwinner platforms.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ include/uapi/drm/drm_fourcc.h | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/include/uapi/drm/drm_fourcc.h b/include/uapi/drm/drm_fourcc.h
+index e04613d30a13..1b7ef9102582 100644
+--- a/include/uapi/drm/drm_fourcc.h
++++ b/include/uapi/drm/drm_fourcc.h
+@@ -183,6 +183,7 @@ extern "C" {
+ #define DRM_FORMAT_MOD_VENDOR_QCOM    0x05
+ #define DRM_FORMAT_MOD_VENDOR_VIVANTE 0x06
+ #define DRM_FORMAT_MOD_VENDOR_BROADCOM 0x07
++#define DRM_FORMAT_MOD_VENDOR_ALLWINNER 0x08
+ /* add more to the end as needed */
+ 
+ #define DRM_FORMAT_RESERVED	      ((1ULL << 56) - 1)
+@@ -405,6 +406,15 @@ extern "C" {
+  */
+ #define DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED fourcc_mod_code(BROADCOM, 1)
+ 
++/*
++ * Allwinner "MB32" tiled format
++ *
++ * This is the primary layout coming out of the VPU, where pixels are tiled
++ * 32x32.
++ */
++#define DRM_FORMAT_MOD_ALLWINNER_MB32_TILED fourcc_mod_code(ALLWINNER, 1)
++
++
+ #if defined(__cplusplus)
+ }
+ #endif
+-- 
+2.18.0
+
+From 169db6d795fb0064b3732e8b713566f1e85048bf Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:47:50 +0100
+Subject: [PATCH 09/25] drm/sun4i: Add a dedicated ioctl call for allocating
+ tiled buffers
+
+This introduces a dedicated ioctl for allocating tiled buffers in the
+Allwinner MB32 format, that comes with a handful of specific
+constraints. In particular, the stride of the buffers is expected to be
+aligned to 32 bytes.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_drv.c | 96 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun4i_drv.h |  2 +
+ include/uapi/drm/sun4i_drm.h      | 42 ++++++++++++++
+ 3 files changed, 140 insertions(+)
+ create mode 100644 include/uapi/drm/sun4i_drm.h
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index 00b0e9dabb77..46ab39ae0a23 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -21,11 +21,18 @@
+ #include <drm/drm_gem_cma_helper.h>
+ #include <drm/drm_fb_helper.h>
+ #include <drm/drm_of.h>
++#include <drm/sun4i_drm.h>
+ 
+ #include "sun4i_drv.h"
+ #include "sun4i_frontend.h"
+ #include "sun4i_framebuffer.h"
+ #include "sun4i_tcon.h"
++#include "sun4i_format.h"
++
++static const struct drm_ioctl_desc sun4i_drv_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(SUN4I_GEM_CREATE_TILED, drm_sun4i_gem_create_tiled,
++			  DRM_AUTH | DRM_RENDER_ALLOW),
++};
+ 
+ DEFINE_DRM_GEM_CMA_FOPS(sun4i_drv_fops);
+ 
+@@ -34,6 +41,8 @@ static struct drm_driver sun4i_drv_driver = {
+ 
+ 	/* Generic Operations */
+ 	.lastclose		= drm_fb_helper_lastclose,
++	.ioctls			= sun4i_drv_ioctls,
++	.num_ioctls		= ARRAY_SIZE(sun4i_drv_ioctls),
+ 	.fops			= &sun4i_drv_fops,
+ 	.name			= "sun4i-drm",
+ 	.desc			= "Allwinner sun4i Display Engine",
+@@ -69,6 +78,93 @@ int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
+ 	return drm_gem_cma_dumb_create_internal(file_priv, drm, args);
+ }
+ 
++int drm_sun4i_gem_create_tiled(struct drm_device *drm, void *data,
++			       struct drm_file *file_priv)
++{
++	struct drm_sun4i_gem_create_tiled *args = data;
++	struct drm_gem_cma_object *cma_obj;
++	struct drm_gem_object *gem_obj;
++	uint32_t luma_stride, chroma_stride;
++	uint32_t luma_height, chroma_height;
++	int ret;
++
++	if (!sun4i_format_supports_tiling(args->format))
++		return -EINVAL;
++
++	memset(args->pitches, 0, sizeof(args->pitches));
++	memset(args->offsets, 0, sizeof(args->offsets));
++
++	/* Stride and height are aligned to 32 bytes for MB32 tiled format. */
++	luma_stride = ALIGN(args->width, 32);
++	luma_height = ALIGN(args->height, 32);
++
++	if (sun4i_format_is_semiplanar(args->format)) {
++		chroma_stride = luma_stride;
++
++		if (sun4i_format_is_yuv420(args->format))
++			chroma_height = ALIGN(DIV_ROUND_UP(args->height, 2), 32);
++		else if (sun4i_format_is_yuv422(args->format))
++			chroma_height = luma_height;
++		else
++			return -EINVAL;
++
++		args->pitches[0] = luma_stride;
++		args->pitches[1] = chroma_stride;
++
++		args->offsets[0] = 0;
++		args->offsets[1] = luma_stride * luma_height;
++
++		args->size = luma_stride * luma_height +
++			     chroma_stride * chroma_height;
++	} else if (sun4i_format_is_planar(args->format)) {
++		if (sun4i_format_is_yuv411(args->format)) {
++			chroma_stride = ALIGN(DIV_ROUND_UP(args->width, 4), 32);
++			chroma_height = luma_height;
++		} if (sun4i_format_is_yuv420(args->format)) {
++			chroma_stride = ALIGN(DIV_ROUND_UP(args->width, 2), 32);
++			chroma_height = ALIGN(DIV_ROUND_UP(args->height, 2), 32);
++		} else if (sun4i_format_is_yuv422(args->format)) {
++			chroma_stride = ALIGN(DIV_ROUND_UP(args->width, 2), 32);
++			chroma_height = luma_height;
++		} else {
++			return -EINVAL;
++		}
++
++		args->pitches[0] = luma_stride;
++		args->pitches[1] = chroma_stride;
++		args->pitches[2] = chroma_stride;
++
++		args->offsets[0] = 0;
++		args->offsets[1] = luma_stride * luma_height;
++		args->offsets[2] = luma_stride * luma_height +
++				   chroma_stride * chroma_height;
++
++		args->size = luma_stride * luma_height +
++			     chroma_stride * chroma_height * 2;
++	} else {
++		/* No support for packed formats in tiled mode. */
++		return -EINVAL;
++	}
++
++	cma_obj = drm_gem_cma_create(drm, args->size);
++	if (IS_ERR(cma_obj))
++		return PTR_ERR(cma_obj);
++
++	gem_obj = &cma_obj->base;
++
++	/*
++	 * allocate a id of idr table where the obj is registered
++	 * and handle has the id what user can see.
++	 */
++	ret = drm_gem_handle_create(file_priv, gem_obj, &args->handle);
++	/* drop reference from allocate - handle holds it now. */
++	drm_gem_object_put_unlocked(gem_obj);
++	if (ret)
++		return ret;
++
++	return PTR_ERR_OR_ZERO(cma_obj);
++}
++
+ static void sun4i_remove_framebuffers(void)
+ {
+ 	struct apertures_struct *ap;
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.h b/drivers/gpu/drm/sun4i/sun4i_drv.h
+index 47969711a889..308ff4bfcdd5 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.h
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.h
+@@ -26,5 +26,7 @@ struct sun4i_drv {
+ int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
+ 			      struct drm_device *drm,
+ 			      struct drm_mode_create_dumb *args);
++int drm_sun4i_gem_create_tiled(struct drm_device *dev, void *data,
++			       struct drm_file *file_priv);
+ 
+ #endif /* _SUN4I_DRV_H_ */
+diff --git a/include/uapi/drm/sun4i_drm.h b/include/uapi/drm/sun4i_drm.h
+new file mode 100644
+index 000000000000..2c77584b057b
+--- /dev/null
++++ b/include/uapi/drm/sun4i_drm.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0+ WITH Linux-syscall-note */
++/* sun4i_drm.h
++ *
++ * Copyright (C) 2018 Paul Kocialkowski <paul.kocialkowski@bootlin.com>
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#ifndef _UAPI_SUN4I_DRM_H_
++#define _UAPI_SUN4I_DRM_H_
++
++#include "drm.h"
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++struct drm_sun4i_gem_create_tiled {
++	__u32 height;
++	__u32 width;
++	__u32 format;
++	/* handle, offsets, pitches, size will be returned */
++	__u32 handle;
++	__u32 pitches[4];
++	__u32 offsets[4];
++	__u64 size;
++};
++
++#define DRM_SUN4I_GEM_CREATE_TILED	0x00
++
++#define DRM_IOCTL_SUN4I_GEM_CREATE_TILED \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SUN4I_GEM_CREATE_TILED, \
++		 struct drm_sun4i_gem_create_tiled)
++
++#if defined(__cplusplus)
++}
++#endif
++
++#endif /* _UAPI_SUN4I_DRM_H_ */
+-- 
+2.18.0
+
+From 403b6bdd36c68467d2a7f370d981f6cc55fa2e7e Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 21 Mar 2018 15:54:44 +0100
+Subject: [PATCH 10/25] drm/sun4i: Add support for YUV-based formats in MB32
+ tiles
+
+This adds all the required configuration and support for handling YUV
+formats tiled with the Allwinner MB32 modifier. This newly-introduced
+YUV support should be in as good a shape as RGB support.
+
+While this implementation covers most MB32-capable formats supported
+by the frontend, only NV12-based formats were actually tested.
+Since most of the logic is common, it is likely that other formats will
+work just as well.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c  |  10 ++-
+ drivers/gpu/drm/sun4i/sun4i_backend.h  |   2 +-
+ drivers/gpu/drm/sun4i/sun4i_drv.c      |   1 +
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 100 +++++++++++++++++++++----
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |   3 +-
+ drivers/gpu/drm/sun4i/sun4i_layer.c    |  16 +++-
+ 6 files changed, 113 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 450e0345337c..17dca4df00f2 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -147,11 +147,14 @@ static const uint32_t sun4i_backend_formats[] = {
+ 	DRM_FORMAT_VYUY,
+ };
+ 
+-bool sun4i_backend_format_is_supported(uint32_t fmt)
++bool sun4i_backend_format_is_supported(uint32_t fmt, uint64_t modifier)
+ {
+ 	bool found = false;
+ 	unsigned int i;
+ 
++	if (modifier == DRM_FORMAT_MOD_ALLWINNER_MB32_TILED)
++		return false;
++
+ 	for (i = 0; i < ARRAY_SIZE(sun4i_backend_formats); i++) {
+ 		if (sun4i_backend_formats[i] == fmt) {
+ 			found = true;
+@@ -453,7 +456,8 @@ static bool sun4i_backend_plane_uses_frontend(struct drm_plane_state *state)
+ 	 * not supported by either. There is still room to check this later in
+ 	 * the atomic check process.
+ 	 */
+-	if (!sun4i_backend_format_is_supported(fb->format->format))
++	if (!sun4i_backend_format_is_supported(fb->format->format,
++					       fb->modifier))
+ 		return true;
+ 
+ 	/*
+@@ -505,7 +509,7 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 		struct drm_format_name_buf format_name;
+ 
+ 		if (sun4i_backend_plane_uses_frontend(plane_state)) {
+-			if (!sun4i_frontend_format_is_supported(fb->format->format)) {
++			if (!sun4i_frontend_plane_check(plane_state)) {
+ 				DRM_DEBUG_DRIVER("Frontend plane check failed\n");
+ 				return -EINVAL;
+ 			}
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index f82bdb34da56..e33be2307c67 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -210,6 +210,6 @@ int sun4i_backend_update_layer_zpos(struct sun4i_backend *backend,
+ 				    int layer, struct drm_plane *plane);
+ void sun4i_backend_disable_layer_frontend(struct sun4i_backend *backend,
+ 					  int layer);
+-bool sun4i_backend_format_is_supported(uint32_t fmt);
++bool sun4i_backend_format_is_supported(uint32_t fmt, uint64_t modifier);
+ 
+ #endif /* _SUN4I_BACKEND_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index 46ab39ae0a23..b4974c9d1f2a 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -208,6 +208,7 @@ static int sun4i_drv_bind(struct device *dev)
+ 	}
+ 
+ 	drm_mode_config_init(drm);
++	drm->mode_config.allow_fb_modifiers = true;
+ 
+ 	ret = component_bind_all(drm->dev, drm);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index d9e58e96119c..85f75046712c 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -99,16 +99,56 @@ void sun4i_frontend_update_buffer(struct sun4i_frontend *frontend,
+ 	width = state->src_w >> 16;
+ 	height = state->src_h >> 16;
+ 
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD0_REG,
+-		     fb->pitches[0]);
++	if (fb->modifier == DRM_FORMAT_MOD_ALLWINNER_MB32_TILED) {
++		/*
++		 * In MB32 tiled mode, the stride is defined as the distance
++		 * between the start of the end line of the current tile and
++		 * the start of the first line in the next vertical tile.
++		 *
++		 * Tiles are represented linearly in memory, thus the end line
++		 * of current tile starts at: 31 * 32 (31 lines of 32 cols),
++		 * the next vertical tile starts at: 32-bit-aligned-width * 32
++		 * and the distance is: 32 * (32-bit-aligned-width - 31).
++		 */
++
++		stride = (fb->pitches[0] - 31) * 32;
++		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD0_REG,
++			     stride);
++
++		/* Offset of the bottom-right point in the end tile. */
++		offset = (width + (32 - 1)) & (32 - 1);
++		regmap_write(frontend->regs, SUN4I_FRONTEND_TB_OFF0_REG,
++			     SUN4I_FRONTEND_TB_OFF_X1(offset));
++
++		if (drm_format_num_planes(format) > 1) {
++			stride = (fb->pitches[1] - 31) * 32;
++			regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD1_REG,
++				     stride);
++
++			regmap_write(frontend->regs, SUN4I_FRONTEND_TB_OFF1_REG,
++				     SUN4I_FRONTEND_TB_OFF_X1(offset));
++		}
++
++		if (drm_format_num_planes(format) > 2) {
++			stride = (fb->pitches[2] - 31) * 32;
++			regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD2_REG,
++				     stride);
++
++			regmap_write(frontend->regs, SUN4I_FRONTEND_TB_OFF2_REG,
++				     SUN4I_FRONTEND_TB_OFF_X1(offset));
++		}
++	} else {
++		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD0_REG,
++			     fb->pitches[0]);
+ 
+-	if (drm_format_num_planes(format) > 1)
+-		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD1_REG,
+-			     fb->pitches[1]);
++		if (drm_format_num_planes(format) > 1)
++			regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD1_REG,
++				     fb->pitches[1]);
+ 
+-	if (drm_format_num_planes(format) > 2)
+-		regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD2_REG,
+-			     fb->pitches[2]);
++		if (drm_format_num_planes(format) > 2)
++			regmap_write(frontend->regs, SUN4I_FRONTEND_LINESTRD2_REG,
++				     fb->pitches[2]);
++	}
+ 
+ 	/* Set the physical address of the buffer in memory */
+ 	paddr = drm_fb_cma_get_gem_addr(fb, state, 0);
+@@ -155,14 +195,22 @@ static int sun4i_frontend_drm_format_to_input_fmt(uint32_t fmt, u32 *val)
+ 	return 0;
+ }
+ 
+-static int sun4i_frontend_drm_format_to_input_mode(uint32_t fmt, u32 *val)
++static int sun4i_frontend_drm_format_to_input_mode(uint32_t fmt, u32 *val,
++						   uint64_t modifier)
+ {
++	bool tiled = modifier == DRM_FORMAT_MOD_ALLWINNER_MB32_TILED;
++
++	if (tiled && !sun4i_format_supports_tiling(fmt))
++		return -EINVAL;
++
+ 	if (sun4i_format_is_packed(fmt))
+ 		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PACKED;
+ 	else if (sun4i_format_is_semiplanar(fmt))
+-		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_SEMIPLANAR;
++		*val = tiled ? SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_MB32_SEMIPLANAR
++			     : SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_SEMIPLANAR;
+ 	else if (sun4i_format_is_planar(fmt))
+-		*val = SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PLANAR;
++		*val = tiled ? SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_MB32_PLANAR
++			     : SUN4I_FRONTEND_INPUT_FMT_DATA_MOD_PLANAR;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -268,7 +316,7 @@ static const uint32_t sun4i_frontend_formats[] = {
+ 	DRM_FORMAT_YVU411,
+ };
+ 
+-bool sun4i_frontend_format_is_supported(uint32_t fmt)
++bool sun4i_frontend_format_is_supported(uint32_t fmt, uint64_t modifier)
+ {
+ 	bool found = false;
+ 	unsigned int i;
+@@ -283,6 +331,31 @@ bool sun4i_frontend_format_is_supported(uint32_t fmt)
+ 	if (!found)
+ 		return false;
+ 
++	if (modifier == DRM_FORMAT_MOD_ALLWINNER_MB32_TILED)
++		return sun4i_format_supports_tiling(fmt);
++
++	return true;
++}
++
++bool sun4i_frontend_plane_check(struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	uint32_t format = fb->format->format;
++	uint32_t width = state->src_w >> 16;
++	uint64_t modifier = fb->modifier;
++	bool supported;
++
++	supported = sun4i_frontend_format_is_supported(format, modifier);
++	if (!supported)
++		return false;
++
++	/* Width is required to be even for MB32 tiled format. */
++	if (modifier == DRM_FORMAT_MOD_ALLWINNER_MB32_TILED &&
++	    (width % 2) != 0) {
++		DRM_DEBUG_DRIVER("MB32 tiled format requires an even width\n");
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+@@ -320,7 +393,8 @@ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 		return ret;
+ 	}
+ 
+-	ret = sun4i_frontend_drm_format_to_input_mode(format, &in_mod_val);
++	ret = sun4i_frontend_drm_format_to_input_mode(format, &in_mod_val,
++						      fb->modifier);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Invalid input mode\n");
+ 		return ret;
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 6dd1d18752f4..ab6ab4f16f74 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -134,7 +134,8 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ 				 struct drm_plane *plane);
+ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				  struct drm_plane *plane, uint32_t out_fmt);
+-bool sun4i_frontend_format_is_supported(uint32_t fmt);
++bool sun4i_frontend_format_is_supported(uint32_t fmt, uint64_t modifier);
++bool sun4i_frontend_plane_check(struct drm_plane_state *plane_state);
+ bool sun4i_frontend_format_chroma_requires_swap(uint32_t fmt);
+ 
+ #endif /* _SUN4I_FRONTEND_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index d70057c52f95..5652a8a11bf9 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -115,6 +115,13 @@ static void sun4i_backend_layer_atomic_update(struct drm_plane *plane,
+ 	sun4i_backend_layer_enable(backend, layer->id, true);
+ }
+ 
++static bool sun4i_layer_format_mod_supported(struct drm_plane *plane,
++					     uint32_t format, uint64_t modifier)
++{
++	return sun4i_backend_format_is_supported(format, modifier) ||
++		sun4i_frontend_format_is_supported(format, modifier);
++}
++
+ static const struct drm_plane_helper_funcs sun4i_backend_layer_helper_funcs = {
+ 	.atomic_disable	= sun4i_backend_layer_atomic_disable,
+ 	.atomic_update	= sun4i_backend_layer_atomic_update,
+@@ -127,6 +134,7 @@ static const struct drm_plane_funcs sun4i_backend_layer_funcs = {
+ 	.disable_plane		= drm_atomic_helper_disable_plane,
+ 	.reset			= sun4i_backend_layer_reset,
+ 	.update_plane		= drm_atomic_helper_update_plane,
++	.format_mod_supported	= sun4i_layer_format_mod_supported,
+ };
+ 
+ static const uint32_t sun4i_layer_formats[] = {
+@@ -162,6 +170,12 @@ static const uint32_t sun4i_layer_formats[] = {
+ 	DRM_FORMAT_YVU411,
+ };
+ 
++static const uint64_t sun4i_layer_modifiers[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_ALLWINNER_MB32_TILED,
++	DRM_FORMAT_MOD_INVALID
++};
++
+ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 						struct sun4i_backend *backend,
+ 						enum drm_plane_type type)
+@@ -178,7 +192,7 @@ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 				       &sun4i_backend_layer_funcs,
+ 				       sun4i_layer_formats,
+ 				       ARRAY_SIZE(sun4i_layer_formats),
+-				       NULL, type, NULL);
++				       sun4i_layer_modifiers, type, NULL);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't initialize layer\n");
+ 		return ERR_PTR(ret);
+-- 
+2.18.0
+
+From 13d1cab6dd5c5576c8894bd01be658953b81d084 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 27 Mar 2018 11:04:25 +0200
+Subject: [PATCH 11/25] drm/sun4i: Fix BGRX/RGBX pixel format definition
+
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index ab6ab4f16f74..8d5a9c1a50f6 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -63,8 +63,8 @@
+ #define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_YVYU			3
+ #define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_UV			0
+ #define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_VU			1
+-#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_XRGB			0
+-#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_BGRX			1
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_BGRX			0
++#define SUN4I_FRONTEND_INPUT_FMT_DATA_PS_XRGB			1
+ 
+ #define SUN4I_FRONTEND_OUTPUT_FMT_REG		0x05c
+ #define SUN4I_FRONTEND_OUTPUT_FMT_DATA_FMT_BGRX8888	1
+-- 
+2.18.0
+
+From c4e4b2f6ebb1911c98ff685e1977f35636f5e3dd Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Thu, 19 Apr 2018 14:52:32 +0200
+Subject: [PATCH 12/25] drm/sun4i: Add missing frontend compatible for the A20
+
+This adds the appropriate device-tree compatible for hooking frontend
+support for the A20, that was tested to work on the platform.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 85f75046712c..f567f82c23dd 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -658,6 +658,7 @@ static const struct dev_pm_ops sun4i_frontend_pm_ops = {
+ };
+ 
+ const struct of_device_id sun4i_frontend_of_table[] = {
++	{ .compatible = "allwinner,sun7i-a20-display-frontend" },
+ 	{ .compatible = "allwinner,sun8i-a33-display-frontend" },
+ 	{ }
+ };
+-- 
+2.18.0
+
+From 0dcaaa91f4856997d5b15dd6f1b07b6187de0bd6 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 14:59:46 +0200
+Subject: [PATCH 13/25] drm/sun4i: Move access control before setting the
+ register as documented
+
+Unlike what is currently being done, the ACCESS_CTRL bit documentation asks
+that this bit should be set before modifying any register. The code in the
+BSP also does this, so make sure we do this as well.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index f567f82c23dd..ba0b9e9ba643 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -53,6 +53,10 @@ static void sun4i_frontend_scaler_init(struct sun4i_frontend *frontend)
+ {
+ 	int i;
+ 
++	regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
++			  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL,
++			  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL);
++
+ 	for (i = 0; i < 32; i++) {
+ 		regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZCOEF0_REG(i),
+ 			     sun4i_frontend_horz_coef[2 * i]);
+@@ -68,9 +72,6 @@ static void sun4i_frontend_scaler_init(struct sun4i_frontend *frontend)
+ 			     sun4i_frontend_vert_coef[i]);
+ 	}
+ 
+-	regmap_update_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
+-			   SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL,
+-			   SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL);
+ }
+ 
+ int sun4i_frontend_init(struct sun4i_frontend *frontend)
+-- 
+2.18.0
+
+From 89c379b1b8e754737aad02d7d0450dbdbdf56ad1 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 16:12:03 +0200
+Subject: [PATCH 14/25] drm/sun4i: frontend: Add a quirk structure
+
+The ACCESS_CTRL bit is not found on all the variants of the frontend, so
+let's introduce a structure that will hold whether or not we need to set
+it, and associate it with the compatible.
+
+This will be extended for further similar quirks later on.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 21 +++++++++++++++++----
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  6 ++++++
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index ba0b9e9ba643..249ebd6b344d 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -10,6 +10,7 @@
+ #include <linux/clk.h>
+ #include <linux/component.h>
+ #include <linux/module.h>
++#include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+@@ -53,9 +54,10 @@ static void sun4i_frontend_scaler_init(struct sun4i_frontend *frontend)
+ {
+ 	int i;
+ 
+-	regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
+-			  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL,
+-			  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL);
++	if (frontend->data->has_access_ctrl)
++		regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
++				  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL,
++				  SUN4I_FRONTEND_FRM_CTRL_COEF_ACCESS_CTRL);
+ 
+ 	for (i = 0; i < 32; i++) {
+ 		regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZCOEF0_REG(i),
+@@ -546,6 +548,10 @@ static int sun4i_frontend_bind(struct device *dev, struct device *master,
+ 	frontend->dev = dev;
+ 	frontend->node = dev->of_node;
+ 
++	frontend->data = of_device_get_match_data(dev);
++	if (!frontend->data)
++		return -ENODEV;
++
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	regs = devm_ioremap_resource(dev, res);
+ 	if (IS_ERR(regs))
+@@ -658,9 +664,16 @@ static const struct dev_pm_ops sun4i_frontend_pm_ops = {
+ 	.runtime_suspend	= sun4i_frontend_runtime_suspend,
+ };
+ 
++static const struct sun4i_frontend_data sun8i_a33_frontend = {
++	.has_access_ctrl	= true,
++};
++
+ const struct of_device_id sun4i_frontend_of_table[] = {
+ 	{ .compatible = "allwinner,sun7i-a20-display-frontend" },
+-	{ .compatible = "allwinner,sun8i-a33-display-frontend" },
++	{
++		.compatible = "allwinner,sun8i-a33-display-frontend",
++		.data = &sun8i_a33_frontend
++	},
+ 	{ }
+ };
+ EXPORT_SYMBOL(sun4i_frontend_of_table);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 8d5a9c1a50f6..2e1d0af2efff 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -110,6 +110,10 @@ struct drm_plane;
+ struct regmap;
+ struct reset_control;
+ 
++struct sun4i_frontend_data {
++	bool	has_access_ctrl;
++};
++
+ struct sun4i_frontend {
+ 	struct list_head	list;
+ 	struct device		*dev;
+@@ -120,6 +124,8 @@ struct sun4i_frontend {
+ 	struct clk		*ram_clk;
+ 	struct regmap		*regs;
+ 	struct reset_control	*reset;
++
++	const struct sun4i_frontend_data	*data;
+ };
+ 
+ extern const struct of_device_id sun4i_frontend_of_table[];
+-- 
+2.18.0
+
+From 6f875eb61594351694a96e1fbcb2e5fb278f9098 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 16:13:32 +0200
+Subject: [PATCH 15/25] fixup! drm/sun4i: Add missing frontend compatible for
+ the A20
+
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 249ebd6b344d..3220d1873b71 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -664,12 +664,19 @@ static const struct dev_pm_ops sun4i_frontend_pm_ops = {
+ 	.runtime_suspend	= sun4i_frontend_runtime_suspend,
+ };
+ 
++static const struct sun4i_frontend_data sun7i_a20_frontend = {
++	/* Nothing to see, move along.. */
++};
++
+ static const struct sun4i_frontend_data sun8i_a33_frontend = {
+ 	.has_access_ctrl	= true,
+ };
+ 
+ const struct of_device_id sun4i_frontend_of_table[] = {
+-	{ .compatible = "allwinner,sun7i-a20-display-frontend" },
++	{
++		.compatible = "allwinner,sun7i-a20-display-frontend",
++		.data = &sun7i_a20_frontend
++	},
+ 	{
+ 		.compatible = "allwinner,sun8i-a33-display-frontend",
+ 		.data = &sun8i_a33_frontend
+-- 
+2.18.0
+
+From ea053aa4d36987912a4d5350e7b69c0c84e0a1ea Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 15:52:43 +0200
+Subject: [PATCH 16/25] drm/sun4i: Set the coef_rdy bit right after the coef
+ have been set
+
+The COEF_RDY bit is used to tell the hardware that new FIR filters
+coefficients have been written to the registers and that the hardware
+should take them into account starting next frame.
+
+The current code doesn't set that bit right after, but before, which
+obviously doesn't work. Move it where it belongs.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 3220d1873b71..4e78d39af97b 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -74,6 +74,10 @@ static void sun4i_frontend_scaler_init(struct sun4i_frontend *frontend)
+ 			     sun4i_frontend_vert_coef[i]);
+ 	}
+ 
++	regmap_write_bits(frontend->regs,
++			  SUN4I_FRONTEND_FRM_CTRL_REG,
++			  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY,
++			  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY);
+ }
+ 
+ int sun4i_frontend_init(struct sun4i_frontend *frontend)
+@@ -435,11 +439,6 @@ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 				     SUN4I_FRONTEND_CSC_COEF_REG(i),
+ 				     sunxi_bt601_yuv2rgb_coef[i]);
+ 
+-		regmap_update_bits(frontend->regs,
+-				   SUN4I_FRONTEND_FRM_CTRL_REG,
+-				   SUN4I_FRONTEND_FRM_CTRL_COEF_RDY,
+-				   SUN4I_FRONTEND_FRM_CTRL_COEF_RDY);
+-
+ 		bypass = 0;
+ 	} else {
+ 		bypass = SUN4I_FRONTEND_BYPASS_CSC_EN;
+-- 
+2.18.0
+
+From 7e23cd811dc75b6f121c37172fad502c57549ad9 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 15:54:40 +0200
+Subject: [PATCH 17/25] drm/sun4i: Make COEF_RDY conditional
+
+The COEF_RDY bit isn't found in all the SoCs featuring some variant of the
+frontend.
+
+Add it to our quirks structure.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 11 ++++++-----
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  1 +
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 4e78d39af97b..1de2e849bcfc 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -74,10 +74,11 @@ static void sun4i_frontend_scaler_init(struct sun4i_frontend *frontend)
+ 			     sun4i_frontend_vert_coef[i]);
+ 	}
+ 
+-	regmap_write_bits(frontend->regs,
+-			  SUN4I_FRONTEND_FRM_CTRL_REG,
+-			  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY,
+-			  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY);
++	if (frontend->data->has_coef_rdy_bit)
++		regmap_write_bits(frontend->regs,
++				  SUN4I_FRONTEND_FRM_CTRL_REG,
++				  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY,
++				  SUN4I_FRONTEND_FRM_CTRL_COEF_RDY);
+ }
+ 
+ int sun4i_frontend_init(struct sun4i_frontend *frontend)
+@@ -664,7 +665,7 @@ static const struct dev_pm_ops sun4i_frontend_pm_ops = {
+ };
+ 
+ static const struct sun4i_frontend_data sun7i_a20_frontend = {
+-	/* Nothing to see, move along.. */
++	.has_coef_rdy_bit	= true,
+ };
+ 
+ static const struct sun4i_frontend_data sun8i_a33_frontend = {
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 2e1d0af2efff..29de63282041 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -112,6 +112,7 @@ struct reset_control;
+ 
+ struct sun4i_frontend_data {
+ 	bool	has_access_ctrl;
++	bool	has_coef_rdy_bit;
+ };
+ 
+ struct sun4i_frontend {
+-- 
+2.18.0
+
+From ddaeb02f53b7f7afedc1e901c8f99272e6921f9e Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 16:17:16 +0200
+Subject: [PATCH 18/25] drm/sun4i: frontend: Move the FIR filter phases to our
+ quirks
+
+The FIR filters phase depend on the SoC, so let's move it to our quirks
+structure instead of removing them.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 28 ++++++++++++++++++++------
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  5 +++++
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 1de2e849bcfc..9075aa670765 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -424,12 +424,18 @@ int sun4i_frontend_update_formats(struct sun4i_frontend *frontend,
+ 	 * I have no idea what this does exactly, but it seems to be
+ 	 * related to the scaler FIR filter phase parameters.
+ 	 */
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZPHASE_REG, 0x400);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_HORZPHASE_REG, 0x400);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTPHASE0_REG, 0x400);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTPHASE0_REG, 0x400);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTPHASE1_REG, 0x400);
+-	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTPHASE1_REG, 0x400);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZPHASE_REG,
++		     frontend->data->ch_phase[0].horzphase);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_HORZPHASE_REG,
++		     frontend->data->ch_phase[1].horzphase);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTPHASE0_REG,
++		     frontend->data->ch_phase[0].vertphase[0]);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTPHASE0_REG,
++		     frontend->data->ch_phase[1].vertphase[0]);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTPHASE1_REG,
++		     frontend->data->ch_phase[0].vertphase[1]);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTPHASE1_REG,
++		     frontend->data->ch_phase[1].vertphase[1]);
+ 
+ 	if (sun4i_format_is_yuv(format) &&
+ 	    !sun4i_format_is_yuv(out_fmt)) {
+@@ -669,6 +675,16 @@ static const struct sun4i_frontend_data sun7i_a20_frontend = {
+ };
+ 
+ static const struct sun4i_frontend_data sun8i_a33_frontend = {
++	.ch_phase		= {
++		{
++			.horzphase = 0x400,
++			.vertphase = { 0x400, 0x400 },
++		},
++		{
++			.horzphase = 0x400,
++			.vertphase = { 0x400, 0x400 },
++		},
++	},
+ 	.has_access_ctrl	= true,
+ };
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 29de63282041..36182355b98e 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -113,6 +113,11 @@ struct reset_control;
+ struct sun4i_frontend_data {
+ 	bool	has_access_ctrl;
+ 	bool	has_coef_rdy_bit;
++
++	struct {
++		u32	horzphase;
++		u32	vertphase[2];
++	} ch_phase[2];
+ };
+ 
+ struct sun4i_frontend {
+-- 
+2.18.0
+
+From 146d45788a622fc21d25e77d96c4f4c0a7e0bb10 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 16:18:10 +0200
+Subject: [PATCH 19/25] fixup! drm/sun4i: Add missing frontend compatible for
+ the A20
+
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index 9075aa670765..bd7a50155af7 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -671,6 +671,16 @@ static const struct dev_pm_ops sun4i_frontend_pm_ops = {
+ };
+ 
+ static const struct sun4i_frontend_data sun7i_a20_frontend = {
++	.ch_phase		= {
++		{
++			.horzphase = 0,
++			.vertphase = { 0, 0 },
++		},
++		{
++			.horzphase = 0xfc000,
++			.vertphase = { 0xfc000, 0xfc000 },
++		},
++	},
+ 	.has_coef_rdy_bit	= true,
+ };
+ 
+-- 
+2.18.0
+
+From 31e6e3052a9c766b0e1d1e1fa1ce902c3ea8386b Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Wed, 11 Jul 2018 16:00:21 +0200
+Subject: [PATCH 20/25] drm/sun4i: Fix last line repeating itself
+
+When using the scaler, the last line will end up repeating itself even way
+after where it's supposed to be output.
+
+This is because, unlike what the datasheet is saying, it seems that the
+input height for the first channel isn't decremented by one, but just the
+actual value.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 11 +++++++----
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  4 ++--
+ 2 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.c b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+index bd7a50155af7..df38e1961309 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.c
+@@ -495,9 +495,10 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ 	}
+ 
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_INSIZE_REG,
+-		     SUN4I_FRONTEND_INSIZE(luma_height, luma_width));
++		     SUN4I_FRONTEND_INSIZE(luma_height, luma_width - 1));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_OUTSIZE_REG,
+-		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h, state->crtc_w));
++		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h - 1,
++					    state->crtc_w - 1));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_HORZFACT_REG,
+ 		     (luma_width << 16) / state->crtc_w);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH0_VERTFACT_REG,
+@@ -505,9 +506,11 @@ void sun4i_frontend_update_coord(struct sun4i_frontend *frontend,
+ 
+ 	/* These also have to be specified, even for interleaved formats. */
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_INSIZE_REG,
+-		     SUN4I_FRONTEND_INSIZE(chroma_height, chroma_width));
++		     SUN4I_FRONTEND_INSIZE(chroma_height - 1,
++					   chroma_width - 1));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_OUTSIZE_REG,
+-		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h, state->crtc_w));
++		     SUN4I_FRONTEND_OUTSIZE(state->crtc_h - 1,
++					    state->crtc_w - 1));
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_HORZFACT_REG,
+ 		     (chroma_width << 16) / state->crtc_w);
+ 	regmap_write(frontend->regs, SUN4I_FRONTEND_CH1_VERTFACT_REG,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_frontend.h b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+index 36182355b98e..a24a5aff5904 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_frontend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_frontend.h
+@@ -73,10 +73,10 @@
+ #define SUN4I_FRONTEND_CSC_COEF_REG(c)		(0x070 + (0x4 * (c)))
+ 
+ #define SUN4I_FRONTEND_CH0_INSIZE_REG		0x100
+-#define SUN4I_FRONTEND_INSIZE(h, w)			((((h) - 1) << 16) | (((w) - 1)))
++#define SUN4I_FRONTEND_INSIZE(h, w)			(((h) << 16) | (w))
+ 
+ #define SUN4I_FRONTEND_CH0_OUTSIZE_REG		0x104
+-#define SUN4I_FRONTEND_OUTSIZE(h, w)			((((h) - 1) << 16) | (((w) - 1)))
++#define SUN4I_FRONTEND_OUTSIZE(h, w)			(((h) << 16) | (w))
+ 
+ #define SUN4I_FRONTEND_CH0_HORZFACT_REG		0x108
+ #define SUN4I_FRONTEND_HORZFACT(i, f)			(((i) << 16) | (f))
+-- 
+2.18.0
+
+From 46a4862ea2c694afe3ac818eae01361eedb98f00 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@siol.net>
+Date: Fri, 6 Jul 2018 18:47:32 +0200
+Subject: [PATCH 21/25] drm/sun4i: Implement zpos for DE2
+
+Initial implementation of DE2 planes only supported fixed zpos.
+
+Expand implementation with configurable zpos property.
+
+Implementation background:
+Channel in DE2 driver represents one DRM plane, whereas pipe is just
+mapped channel to known Z position. Pipe 0 will always be at the bottom,
+pipe 1 just above pipe 0 and so on. If, for example, channel 1 is mapped
+at pipe 0 and channel 0 at pipe 1, whatever is on channel 0 will appear
+on top.
+
+Before this commit, channel id was used for addressing channel related
+registers (prefixed with SUN8I_MIXER_CHAN_UI_ or SUN8I_MIXER_CHAN_VI_)
+and pipe registers (prefixed with SUN8I_MIXER_BLEND_). Additionally,
+register SUN8I_MIXER_BLEND_ROUTE, which takes care for mapping channels
+to pipes had fixed value. It mapped channel 0 to pipe 0, 1 to 1 and so
+on. Consequence of all that was fixed Z order of planes.
+
+With this commit, pipe registers are using zpos property as index and
+channel related registers still use channel id as index. Pipe mapping
+register is now set dynamically too and pipe enable register is rebuild
+every time to make sure only active pipes are enabled.
+
+Testing was done to confirm that there is no issues if bottom plane
+contains pixels with alpha value < 0xff and if it doesn't whole screen.
+
+Tested-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Signed-off-by: Jernej Skrabec <jernej.skrabec@siol.net>
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180706164732.24166-1-jernej.skrabec@siol.net
+---
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    | 15 +++++++--
+ drivers/gpu/drm/sun4i/sun8i_mixer.h    |  4 +++
+ drivers/gpu/drm/sun4i/sun8i_ui_layer.c | 45 ++++++++++++++++----------
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c | 45 ++++++++++++++++----------
+ 4 files changed, 72 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 126899d6f0d3..8e81c24d736e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -260,6 +260,17 @@ const struct de2_fmt_info *sun8i_mixer_format_info(u32 format)
+ 	return NULL;
+ }
+ 
++static void sun8i_mixer_atomic_begin(struct sunxi_engine *engine,
++				     struct drm_crtc_state *old_state)
++{
++	/*
++	 * Disable all pipes at the beginning. They will be enabled
++	 * again if needed in plane update callback.
++	 */
++	regmap_update_bits(engine->regs, SUN8I_MIXER_BLEND_PIPE_CTL,
++			   SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK, 0);
++}
++
+ static void sun8i_mixer_commit(struct sunxi_engine *engine)
+ {
+ 	DRM_DEBUG_DRIVER("Committing changes\n");
+@@ -311,6 +322,7 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ }
+ 
+ static const struct sunxi_engine_ops sun8i_engine_ops = {
++	.atomic_begin	= sun8i_mixer_atomic_begin,
+ 	.commit		= sun8i_mixer_commit,
+ 	.layers_init	= sun8i_layers_init,
+ };
+@@ -432,9 +444,6 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 	regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_ATTR_FCOLOR(0),
+ 		     SUN8I_MIXER_BLEND_COLOR_BLACK);
+ 
+-	/* Fixed zpos for now */
+-	regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_ROUTE, 0x43210);
+-
+ 	plane_cnt = mixer->cfg->vi_num + mixer->cfg->ui_num;
+ 	for (i = 0; i < plane_cnt; i++)
+ 		regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_MODE(i),
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index f34e70c42adf..406c42e752d7 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -44,6 +44,7 @@
+ #define SUN8I_MIXER_BLEND_CK_MIN(x)		(0x10e0 + 0x04 * (x))
+ #define SUN8I_MIXER_BLEND_OUTCTL		0x10fc
+ 
++#define SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK	GENMASK(12, 8)
+ #define SUN8I_MIXER_BLEND_PIPE_CTL_EN(pipe)	BIT(8 + pipe)
+ #define SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(pipe)	BIT(pipe)
+ /* colors are always in AARRGGBB format */
+@@ -51,6 +52,9 @@
+ /* The following numbers are some still unknown magic numbers */
+ #define SUN8I_MIXER_BLEND_MODE_DEF		0x03010301
+ 
++#define SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(n)	(0xf << ((n) << 2))
++#define SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(n)	((n) << 2)
++
+ #define SUN8I_MIXER_BLEND_OUTCTL_INTERLACED	BIT(1)
+ 
+ #define SUN8I_MIXER_FBFMT_ARGB8888	0
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 9a540330cb79..518e1921f47e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -27,7 +27,7 @@
+ #include "sun8i_ui_scaler.h"
+ 
+ static void sun8i_ui_layer_enable(struct sun8i_mixer *mixer, int channel,
+-				  int overlay, bool enable)
++				  int overlay, bool enable, unsigned int zpos)
+ {
+ 	u32 val;
+ 
+@@ -43,18 +43,24 @@ static void sun8i_ui_layer_enable(struct sun8i_mixer *mixer, int channel,
+ 			   SUN8I_MIXER_CHAN_UI_LAYER_ATTR(channel, overlay),
+ 			   SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN, val);
+ 
+-	if (enable)
+-		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(channel);
+-	else
+-		val = 0;
++	if (enable) {
++		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+-	regmap_update_bits(mixer->engine.regs,
+-			   SUN8I_MIXER_BLEND_PIPE_CTL,
+-			   SUN8I_MIXER_BLEND_PIPE_CTL_EN(channel), val);
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_PIPE_CTL, val, val);
++
++		val = channel << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
++
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_ROUTE,
++				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(zpos),
++				   val);
++	}
+ }
+ 
+ static int sun8i_ui_layer_update_coord(struct sun8i_mixer *mixer, int channel,
+-				       int overlay, struct drm_plane *plane)
++				       int overlay, struct drm_plane *plane,
++				       unsigned int zpos)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	u32 src_w, src_h, dst_w, dst_h;
+@@ -137,10 +143,10 @@ static int sun8i_ui_layer_update_coord(struct sun8i_mixer *mixer, int channel,
+ 			 state->dst.x1, state->dst.y1);
+ 	DRM_DEBUG_DRIVER("Layer destination size W: %d H: %d\n", dst_w, dst_h);
+ 	regmap_write(mixer->engine.regs,
+-		     SUN8I_MIXER_BLEND_ATTR_COORD(channel),
++		     SUN8I_MIXER_BLEND_ATTR_COORD(zpos),
+ 		     SUN8I_MIXER_COORD(state->dst.x1, state->dst.y1));
+ 	regmap_write(mixer->engine.regs,
+-		     SUN8I_MIXER_BLEND_ATTR_INSIZE(channel),
++		     SUN8I_MIXER_BLEND_ATTR_INSIZE(zpos),
+ 		     outsize);
+ 
+ 	return 0;
+@@ -238,28 +244,30 @@ static void sun8i_ui_layer_atomic_disable(struct drm_plane *plane,
+ 	struct sun8i_ui_layer *layer = plane_to_sun8i_ui_layer(plane);
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+-	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay, false);
++	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay, false, 0);
+ }
+ 
+ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ 					 struct drm_plane_state *old_state)
+ {
+ 	struct sun8i_ui_layer *layer = plane_to_sun8i_ui_layer(plane);
++	unsigned int zpos = plane->state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+ 	if (!plane->state->visible) {
+ 		sun8i_ui_layer_enable(mixer, layer->channel,
+-				      layer->overlay, false);
++				      layer->overlay, false, 0);
+ 		return;
+ 	}
+ 
+ 	sun8i_ui_layer_update_coord(mixer, layer->channel,
+-				    layer->overlay, plane);
++				    layer->overlay, plane, zpos);
+ 	sun8i_ui_layer_update_formats(mixer, layer->channel,
+ 				      layer->overlay, plane);
+ 	sun8i_ui_layer_update_buffer(mixer, layer->channel,
+ 				     layer->overlay, plane);
+-	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay, true);
++	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay,
++			      true, zpos);
+ }
+ 
+ static struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
+@@ -307,6 +315,7 @@ struct sun8i_ui_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 	enum drm_plane_type type = DRM_PLANE_TYPE_OVERLAY;
+ 	int channel = mixer->cfg->vi_num + index;
+ 	struct sun8i_ui_layer *layer;
++	unsigned int plane_cnt;
+ 	int ret;
+ 
+ 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
+@@ -327,8 +336,10 @@ struct sun8i_ui_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	/* fixed zpos for now */
+-	ret = drm_plane_create_zpos_immutable_property(&layer->plane, channel);
++	plane_cnt = mixer->cfg->ui_num + mixer->cfg->vi_num;
++
++	ret = drm_plane_create_zpos_property(&layer->plane, channel,
++					     0, plane_cnt - 1);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't add zpos property\n");
+ 		return ERR_PTR(ret);
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 5877f8ef5895..17e0d00cfd8a 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -21,7 +21,7 @@
+ #include "sun8i_vi_scaler.h"
+ 
+ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
+-				  int overlay, bool enable)
++				  int overlay, bool enable, unsigned int zpos)
+ {
+ 	u32 val;
+ 
+@@ -37,18 +37,24 @@ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(channel, overlay),
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN, val);
+ 
+-	if (enable)
+-		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(channel);
+-	else
+-		val = 0;
++	if (enable) {
++		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+-	regmap_update_bits(mixer->engine.regs,
+-			   SUN8I_MIXER_BLEND_PIPE_CTL,
+-			   SUN8I_MIXER_BLEND_PIPE_CTL_EN(channel), val);
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_PIPE_CTL, val, val);
++
++		val = channel << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
++
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_ROUTE,
++				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(zpos),
++				   val);
++	}
+ }
+ 
+ static int sun8i_vi_layer_update_coord(struct sun8i_mixer *mixer, int channel,
+-				       int overlay, struct drm_plane *plane)
++				       int overlay, struct drm_plane *plane,
++				       unsigned int zpos)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	const struct drm_format_info *format = state->fb->format;
+@@ -130,10 +136,10 @@ static int sun8i_vi_layer_update_coord(struct sun8i_mixer *mixer, int channel,
+ 			 state->dst.x1, state->dst.y1);
+ 	DRM_DEBUG_DRIVER("Layer destination size W: %d H: %d\n", dst_w, dst_h);
+ 	regmap_write(mixer->engine.regs,
+-		     SUN8I_MIXER_BLEND_ATTR_COORD(channel),
++		     SUN8I_MIXER_BLEND_ATTR_COORD(zpos),
+ 		     SUN8I_MIXER_COORD(state->dst.x1, state->dst.y1));
+ 	regmap_write(mixer->engine.regs,
+-		     SUN8I_MIXER_BLEND_ATTR_INSIZE(channel),
++		     SUN8I_MIXER_BLEND_ATTR_INSIZE(zpos),
+ 		     outsize);
+ 
+ 	return 0;
+@@ -266,28 +272,30 @@ static void sun8i_vi_layer_atomic_disable(struct drm_plane *plane,
+ 	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+-	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, false);
++	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, false, 0);
+ }
+ 
+ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 					 struct drm_plane_state *old_state)
+ {
+ 	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
++	unsigned int zpos = plane->state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+ 	if (!plane->state->visible) {
+ 		sun8i_vi_layer_enable(mixer, layer->channel,
+-				      layer->overlay, false);
++				      layer->overlay, false, 0);
+ 		return;
+ 	}
+ 
+ 	sun8i_vi_layer_update_coord(mixer, layer->channel,
+-				    layer->overlay, plane);
++				    layer->overlay, plane, zpos);
+ 	sun8i_vi_layer_update_formats(mixer, layer->channel,
+ 				      layer->overlay, plane);
+ 	sun8i_vi_layer_update_buffer(mixer, layer->channel,
+ 				     layer->overlay, plane);
+-	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, true);
++	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay,
++			      true, zpos);
+ }
+ 
+ static struct drm_plane_helper_funcs sun8i_vi_layer_helper_funcs = {
+@@ -351,6 +359,7 @@ struct sun8i_vi_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 					       int index)
+ {
+ 	struct sun8i_vi_layer *layer;
++	unsigned int plane_cnt;
+ 	int ret;
+ 
+ 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
+@@ -368,8 +377,10 @@ struct sun8i_vi_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	/* fixed zpos for now */
+-	ret = drm_plane_create_zpos_immutable_property(&layer->plane, index);
++	plane_cnt = mixer->cfg->ui_num + mixer->cfg->vi_num;
++
++	ret = drm_plane_create_zpos_property(&layer->plane, index,
++					     0, plane_cnt - 1);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't add zpos property\n");
+ 		return ERR_PTR(ret);
+-- 
+2.18.0
+
+From 92af4522a2a1def5dddef6d578833058f6a3d5ce Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 17 Jul 2018 09:18:44 +0200
+Subject: [PATCH 22/25] drm/sun4i: sun8i: Avoid clearing blending order at each
+ atomic commit
+
+Blending order is set based on the z position of each DRM plane. The
+blending order register is currently cleared at each atomic DRM commit,
+with the intent that each committed plane will set the appropriate
+bits (based on its z-pos) when enabling the plane.
+
+However, it sometimes happens that a particular plane is left unchanged
+by an atomic commit and thus will not be configured again. In that
+scenario, blending order is cleared and only the bits relevant for the
+planes affected by the commit are set. This leaves the planes that did
+not change without their blending order set in the register, leading
+to that plane not being displayed.
+
+Instead of clearing the blending order register at every atomic commit,
+this change moves the register's initial clear at bind time and only
+clears the bits for a specific plane when disabling it or changing its
+zpos.
+
+This way, planes that are left untouched by a DRM atomic commit are
+no longer disabled.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    | 15 +++------------
+ drivers/gpu/drm/sun4i/sun8i_ui_layer.c | 24 ++++++++++++++++++++----
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c | 24 ++++++++++++++++++++----
+ 3 files changed, 43 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 8e81c24d736e..12cb7183ce51 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -260,17 +260,6 @@ const struct de2_fmt_info *sun8i_mixer_format_info(u32 format)
+ 	return NULL;
+ }
+ 
+-static void sun8i_mixer_atomic_begin(struct sunxi_engine *engine,
+-				     struct drm_crtc_state *old_state)
+-{
+-	/*
+-	 * Disable all pipes at the beginning. They will be enabled
+-	 * again if needed in plane update callback.
+-	 */
+-	regmap_update_bits(engine->regs, SUN8I_MIXER_BLEND_PIPE_CTL,
+-			   SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK, 0);
+-}
+-
+ static void sun8i_mixer_commit(struct sunxi_engine *engine)
+ {
+ 	DRM_DEBUG_DRIVER("Committing changes\n");
+@@ -322,7 +311,6 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ }
+ 
+ static const struct sunxi_engine_ops sun8i_engine_ops = {
+-	.atomic_begin	= sun8i_mixer_atomic_begin,
+ 	.commit		= sun8i_mixer_commit,
+ 	.layers_init	= sun8i_layers_init,
+ };
+@@ -449,6 +437,9 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 		regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_MODE(i),
+ 			     SUN8I_MIXER_BLEND_MODE_DEF);
+ 
++	regmap_update_bits(mixer->engine.regs, SUN8I_MIXER_BLEND_PIPE_CTL,
++			   SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK, 0);
++
+ 	return 0;
+ 
+ err_disable_bus_clk:
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 518e1921f47e..28c15c6ef1ef 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -27,7 +27,8 @@
+ #include "sun8i_ui_scaler.h"
+ 
+ static void sun8i_ui_layer_enable(struct sun8i_mixer *mixer, int channel,
+-				  int overlay, bool enable, unsigned int zpos)
++				  int overlay, bool enable, unsigned int zpos,
++				  unsigned int old_zpos)
+ {
+ 	u32 val;
+ 
+@@ -43,6 +44,18 @@ static void sun8i_ui_layer_enable(struct sun8i_mixer *mixer, int channel,
+ 			   SUN8I_MIXER_CHAN_UI_LAYER_ATTR(channel, overlay),
+ 			   SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN, val);
+ 
++	if (!enable || zpos != old_zpos) {
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_PIPE_CTL,
++				   SUN8I_MIXER_BLEND_PIPE_CTL_EN(old_zpos),
++				   0);
++
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_ROUTE,
++				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(old_zpos),
++				   0);
++	}
++
+ 	if (enable) {
+ 		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+@@ -242,9 +255,11 @@ static void sun8i_ui_layer_atomic_disable(struct drm_plane *plane,
+ 					  struct drm_plane_state *old_state)
+ {
+ 	struct sun8i_ui_layer *layer = plane_to_sun8i_ui_layer(plane);
++	unsigned int old_zpos = old_state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+-	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay, false, 0);
++	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay, false, 0,
++			      old_zpos);
+ }
+ 
+ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+@@ -252,11 +267,12 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ {
+ 	struct sun8i_ui_layer *layer = plane_to_sun8i_ui_layer(plane);
+ 	unsigned int zpos = plane->state->normalized_zpos;
++	unsigned int old_zpos = old_state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+ 	if (!plane->state->visible) {
+ 		sun8i_ui_layer_enable(mixer, layer->channel,
+-				      layer->overlay, false, 0);
++				      layer->overlay, false, 0, old_zpos);
+ 		return;
+ 	}
+ 
+@@ -267,7 +283,7 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ 	sun8i_ui_layer_update_buffer(mixer, layer->channel,
+ 				     layer->overlay, plane);
+ 	sun8i_ui_layer_enable(mixer, layer->channel, layer->overlay,
+-			      true, zpos);
++			      true, zpos, old_zpos);
+ }
+ 
+ static struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 17e0d00cfd8a..f4fe97813f94 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -21,7 +21,8 @@
+ #include "sun8i_vi_scaler.h"
+ 
+ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
+-				  int overlay, bool enable, unsigned int zpos)
++				  int overlay, bool enable, unsigned int zpos,
++				  unsigned int old_zpos)
+ {
+ 	u32 val;
+ 
+@@ -37,6 +38,18 @@ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(channel, overlay),
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN, val);
+ 
++	if (!enable || zpos != old_zpos) {
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_PIPE_CTL,
++				   SUN8I_MIXER_BLEND_PIPE_CTL_EN(old_zpos),
++				   0);
++
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_BLEND_ROUTE,
++				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(old_zpos),
++				   0);
++	}
++
+ 	if (enable) {
+ 		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+@@ -270,9 +283,11 @@ static void sun8i_vi_layer_atomic_disable(struct drm_plane *plane,
+ 					  struct drm_plane_state *old_state)
+ {
+ 	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
++	unsigned int old_zpos = old_state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+-	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, false, 0);
++	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, false, 0,
++			      old_zpos);
+ }
+ 
+ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+@@ -280,11 +295,12 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ {
+ 	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
+ 	unsigned int zpos = plane->state->normalized_zpos;
++	unsigned int old_zpos = old_state->normalized_zpos;
+ 	struct sun8i_mixer *mixer = layer->mixer;
+ 
+ 	if (!plane->state->visible) {
+ 		sun8i_vi_layer_enable(mixer, layer->channel,
+-				      layer->overlay, false, 0);
++				      layer->overlay, false, 0, old_zpos);
+ 		return;
+ 	}
+ 
+@@ -295,7 +311,7 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 	sun8i_vi_layer_update_buffer(mixer, layer->channel,
+ 				     layer->overlay, plane);
+ 	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay,
+-			      true, zpos);
++			      true, zpos, old_zpos);
+ }
+ 
+ static struct drm_plane_helper_funcs sun8i_vi_layer_helper_funcs = {
+-- 
+2.18.0
+
+From 1ef701823d20f497cb3479f0bd3745b0ca702057 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 17 Jul 2018 10:04:56 +0200
+Subject: [PATCH 23/25] drm/sun4i: sun4i: Register quirks with the backend
+ structure
+
+In prevision for introducing a new quirk that will be used at atomic
+plane check time, register the quirks structure with the backend
+structure. This way, it can easily be grabbed where needed.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 2 ++
+ drivers/gpu/drm/sun4i/sun4i_backend.h | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 17dca4df00f2..a3cc398d4d80 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -909,6 +909,8 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 				    : SUN4I_BACKEND_MODCTL_OUT_LCD0));
+ 	}
+ 
++	backend->quirks = quirks;
++
+ 	return 0;
+ 
+ err_disable_ram_clk:
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index e33be2307c67..71de6147b483 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -187,6 +187,8 @@ struct sun4i_backend {
+ 	/* Protects against races in the frontend teardown */
+ 	spinlock_t		frontend_lock;
+ 	bool			frontend_teardown;
++
++	const struct sun4i_backend_quirks	*quirks;
+ };
+ 
+ static inline struct sun4i_backend *
+-- 
+2.18.0
+
+From f06510f5cd34f95068bdf20647c73aa88d25c563 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Tue, 17 Jul 2018 10:11:35 +0200
+Subject: [PATCH 24/25] drm/sun4i: sun4i: Introduce a quirk for lowest plane
+ alpha support
+
+Not all sunxi platforms with the first version of the Display Engine
+support an alpha component on the plane with the lowest z position
+(as in: lowest z-pos), that gets blended with the background color.
+
+In particular, the A13 is known to have this limitation. However, it was
+recently discovered that the A20 and A33 are capable of having alpha on
+their lowest plane.
+
+Thus, this introduces a specific quirk to indicate such support,
+per-platform. Since this was not tested on sun4i and sun6i platforms, a
+conservative approach is kept and this feature is not supported.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index a3cc398d4d80..cdc4a8a91ea2 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -35,6 +35,8 @@
+ struct sun4i_backend_quirks {
+ 	/* backend <-> TCON muxing selection done in backend */
+ 	bool needs_output_muxing;
++	/* alpha at the lowest z position is not always supported */
++	bool supports_lowest_plane_alpha;
+ };
+ 
+ static void sun4i_backend_apply_color_correction(struct sunxi_engine *engine)
+@@ -484,6 +486,7 @@ static void sun4i_backend_atomic_begin(struct sunxi_engine *engine,
+ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 				      struct drm_crtc_state *crtc_state)
+ {
++	struct sun4i_backend *backend = engine_to_sun4i_backend(engine);
+ 	struct drm_plane_state *plane_states[SUN4I_BACKEND_NUM_LAYERS] = { 0 };
+ 	struct drm_atomic_state *state = crtc_state->state;
+ 	struct drm_device *drm = state->dev;
+@@ -584,8 +587,9 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 	}
+ 
+ 	/* We can't have an alpha plane at the lowest position */
+-	if (plane_states[0]->fb->format->has_alpha ||
+-	    (plane_states[0]->alpha != DRM_BLEND_ALPHA_OPAQUE))
++	if ((plane_states[0]->fb->format->has_alpha ||
++	    (plane_states[0]->alpha != DRM_BLEND_ALPHA_OPAQUE)) &&
++	    !backend->quirks->supports_lowest_plane_alpha)
+ 		return -EINVAL;
+ 
+ 	for (i = 1; i < num_planes; i++) {
+@@ -970,9 +974,11 @@ static const struct sun4i_backend_quirks sun6i_backend_quirks = {
+ 
+ static const struct sun4i_backend_quirks sun7i_backend_quirks = {
+ 	.needs_output_muxing = true,
++	.supports_lowest_plane_alpha = true,
+ };
+ 
+ static const struct sun4i_backend_quirks sun8i_a33_backend_quirks = {
++	.supports_lowest_plane_alpha = true,
+ };
+ 
+ static const struct sun4i_backend_quirks sun9i_backend_quirks = {
+-- 
+2.18.0
+
+From 0325de055989c1efbffd9902ae12be2ff73e05c2 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 18 Jul 2018 09:53:37 +0200
+Subject: [PATCH 25/25] fixup! drm/sun4i: sun4i: Introduce a quirk for lowest
+ plane alpha support
+
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 38 ++++++++++++++++-----------
+ drivers/gpu/drm/sun4i/sun4i_backend.h |  1 -
+ 2 files changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index cdc4a8a91ea2..22d56c1f8585 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -486,14 +486,15 @@ static void sun4i_backend_atomic_begin(struct sunxi_engine *engine,
+ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 				      struct drm_crtc_state *crtc_state)
+ {
+-	struct sun4i_backend *backend = engine_to_sun4i_backend(engine);
+ 	struct drm_plane_state *plane_states[SUN4I_BACKEND_NUM_LAYERS] = { 0 };
++	struct sun4i_backend *backend = engine_to_sun4i_backend(engine);
+ 	struct drm_atomic_state *state = crtc_state->state;
+ 	struct drm_device *drm = state->dev;
+ 	struct drm_plane *plane;
+ 	unsigned int num_planes = 0;
+ 	unsigned int num_alpha_planes = 0;
+ 	unsigned int num_frontend_planes = 0;
++	unsigned int num_alpha_planes_max = 1;
+ 	unsigned int num_yuv_planes = 0;
+ 	unsigned int current_pipe = 0;
+ 	unsigned int i;
+@@ -562,34 +563,39 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 	 * the layer with the highest priority.
+ 	 *
+ 	 * The second step is the actual alpha blending, that takes
+-	 * the two pipes as input, and uses the eventual alpha
++	 * the two pipes as input, and uses the potential alpha
+ 	 * component to do the transparency between the two.
+ 	 *
+-	 * This two steps scenario makes us unable to guarantee a
++	 * This two-step scenario makes us unable to guarantee a
+ 	 * robust alpha blending between the 4 layers in all
+ 	 * situations, since this means that we need to have one layer
+ 	 * with alpha at the lowest position of our two pipes.
+ 	 *
+-	 * However, we cannot even do that, since the hardware has a
+-	 * bug where the lowest plane of the lowest pipe (pipe 0,
+-	 * priority 0), if it has any alpha, will discard the pixel
+-	 * entirely and just display the pixels in the background
+-	 * color (black by default).
++	 * However, we cannot even do that on every platform, since the
++	 * hardware has a bug where the lowest plane of the lowest pipe
++	 * (pipe 0, priority 0), if it has any alpha, will discard the
++	 * pixel data entirely and just display the pixels in the
++	 * background color (black by default).
+ 	 *
+-	 * This means that we effectively have only three valid
+-	 * configurations with alpha, all of them with the alpha being
+-	 * on pipe1 with the lowest position, which can be 1, 2 or 3
+-	 * depending on the number of planes and their zpos.
++	 * This means that on the affected platforms, we effectively
++	 * have only three valid configurations with alpha, all of them
++	 * with the alpha being on pipe1 with the lowest position, which
++	 * can be 1, 2 or 3 depending on the number of planes and their zpos.
+ 	 */
+-	if (num_alpha_planes > SUN4I_BACKEND_NUM_ALPHA_LAYERS) {
++
++	/* For platforms that are not affected by the issue described above. */
++	if (backend->quirks->supports_lowest_plane_alpha)
++		num_alpha_planes_max++;
++
++	if (num_alpha_planes > num_alpha_planes_max) {
+ 		DRM_DEBUG_DRIVER("Too many planes with alpha, rejecting...\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* We can't have an alpha plane at the lowest position */
+-	if ((plane_states[0]->fb->format->has_alpha ||
+-	    (plane_states[0]->alpha != DRM_BLEND_ALPHA_OPAQUE)) &&
+-	    !backend->quirks->supports_lowest_plane_alpha)
++	if (!backend->quirks->supports_lowest_plane_alpha &&
++	    (plane_states[0]->fb->format->has_alpha ||
++	    (plane_states[0]->alpha != DRM_BLEND_ALPHA_OPAQUE)))
+ 		return -EINVAL;
+ 
+ 	for (i = 1; i < num_planes; i++) {
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index 71de6147b483..ce1f9385e474 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -167,7 +167,6 @@
+ #define SUN4I_BACKEND_PIPE_OFF(p)		(0x5000 + (0x400 * (p)))
+ 
+ #define SUN4I_BACKEND_NUM_LAYERS		4
+-#define SUN4I_BACKEND_NUM_ALPHA_LAYERS		1
+ #define SUN4I_BACKEND_NUM_FRONTEND_LAYERS	1
+ #define SUN4I_BACKEND_NUM_YUV_PLANES		1
+ 
+-- 
+2.18.0
+

@@ -1,0 +1,26 @@
+From 5adf6ecad50044fef7f8cf19926e8bcd594798e9 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Fri, 13 Jul 2018 11:03:40 +0200
+Subject: [PATCH 48/55] fixup! media: cedrus: Add H264 decoding support
+
+---
+ drivers/media/platform/sunxi/cedrus/cedrus_h264.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/media/platform/sunxi/cedrus/cedrus_h264.c b/drivers/media/platform/sunxi/cedrus/cedrus_h264.c
+index 55700b71d06c..9966b30c1510 100644
+--- a/drivers/media/platform/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/media/platform/sunxi/cedrus/cedrus_h264.c
+@@ -93,6 +93,9 @@ static void cedrus_write_frame_list(struct cedrus_ctx *ctx,
+ 		const struct cedrus_buffer *cedrus_buf;
+ 		struct vb2_buffer *ref_buf;
+ 
++		if (!(dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
++			continue;
++
+ 		ref_buf = ctx->dst_bufs[dpb->buf_index];
+ 		cedrus_buf = vb2_to_cedrus_buffer(ref_buf);
+ 		position = cedrus_buf->codec.h264.position;
+-- 
+2.18.0
+

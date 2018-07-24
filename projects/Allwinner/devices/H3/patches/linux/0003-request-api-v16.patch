@@ -1,0 +1,5572 @@
+From 629ef3a4ce74e614bfbc497c9bae5f59717da5a4 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:26 +0300
+Subject: [PATCH 02/34] uapi/linux/media.h: add request API
+
+Define the public request API.
+
+This adds the new MEDIA_IOC_REQUEST_ALLOC ioctl to allocate a request
+and two ioctls that operate on a request in order to queue the
+contents of the request to the driver and to re-initialize the
+request.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+---
+ include/uapi/linux/media.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/include/uapi/linux/media.h b/include/uapi/linux/media.h
+index 86c7dcc9cba3..b030b0a76dae 100644
+--- a/include/uapi/linux/media.h
++++ b/include/uapi/linux/media.h
+@@ -342,11 +342,23 @@ struct media_v2_topology {
+ 
+ /* ioctls */
+ 
++struct __attribute__ ((packed)) media_request_alloc {
++	__s32 fd;
++};
++
+ #define MEDIA_IOC_DEVICE_INFO	_IOWR('|', 0x00, struct media_device_info)
+ #define MEDIA_IOC_ENUM_ENTITIES	_IOWR('|', 0x01, struct media_entity_desc)
+ #define MEDIA_IOC_ENUM_LINKS	_IOWR('|', 0x02, struct media_links_enum)
+ #define MEDIA_IOC_SETUP_LINK	_IOWR('|', 0x03, struct media_link_desc)
+ #define MEDIA_IOC_G_TOPOLOGY	_IOWR('|', 0x04, struct media_v2_topology)
++#define MEDIA_IOC_REQUEST_ALLOC	_IOWR('|', 0x05, struct media_request_alloc)
++
++/*
++ * These ioctls are called on the request file descriptor as returned
++ * by MEDIA_IOC_REQUEST_ALLOC.
++ */
++#define MEDIA_REQUEST_IOC_QUEUE		_IO('|',  0x80)
++#define MEDIA_REQUEST_IOC_REINIT	_IO('|',  0x81)
+ 
+ #ifndef __KERNEL__
+ 
+-- 
+2.18.0
+
+From eaa2641762983752c67b29bc12bb9a45fd16ae65 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:27 +0300
+Subject: [PATCH 03/34] media-request: implement media requests
+
+Add initial media request support:
+
+1) Add MEDIA_IOC_REQUEST_ALLOC ioctl support to media-device.c
+2) Add struct media_request to store request objects.
+3) Add struct media_request_object to represent a request object.
+4) Add MEDIA_REQUEST_IOC_QUEUE/REINIT ioctl support.
+
+Basic lifecycle: the application allocates a request, adds
+objects to it, queues the request, polls until it is completed
+and can then read the final values of the objects at the time
+of completion. When it closes the file descriptor the request
+memory will be freed (actually, when the last user of that request
+releases the request).
+
+Drivers will bind an object to a request (the 'adds objects to it'
+phase), when MEDIA_REQUEST_IOC_QUEUE is called the request is
+validated (req_validate op), then queued (the req_queue op).
+
+When done with an object it can either be unbound from the request
+(e.g. when the driver has finished with a vb2 buffer) or marked as
+completed (e.g. for controls associated with a buffer). When all
+objects in the request are completed (or unbound), then the request
+fd will signal an exception (poll).
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Co-developed-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Co-developed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Co-developed-by: Alexandre Courbot <acourbot@chromium.org>
+---
+ drivers/media/Makefile        |   3 +-
+ drivers/media/media-device.c  |  14 ++
+ drivers/media/media-request.c | 423 ++++++++++++++++++++++++++++++++++
+ include/media/media-device.h  |  21 ++
+ include/media/media-request.h | 327 ++++++++++++++++++++++++++
+ 5 files changed, 787 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/media/media-request.c
+ create mode 100644 include/media/media-request.h
+
+diff --git a/drivers/media/Makefile b/drivers/media/Makefile
+index 594b462ddf0e..985d35ec6b29 100644
+--- a/drivers/media/Makefile
++++ b/drivers/media/Makefile
+@@ -3,7 +3,8 @@
+ # Makefile for the kernel multimedia device drivers.
+ #
+ 
+-media-objs	:= media-device.o media-devnode.o media-entity.o
++media-objs	:= media-device.o media-devnode.o media-entity.o \
++		   media-request.o
+ 
+ #
+ # I2C drivers should come before other drivers, otherwise they'll fail
+diff --git a/drivers/media/media-device.c b/drivers/media/media-device.c
+index 47bb2254fbfd..77bfb0654ef2 100644
+--- a/drivers/media/media-device.c
++++ b/drivers/media/media-device.c
+@@ -29,6 +29,7 @@
+ #include <media/media-device.h>
+ #include <media/media-devnode.h>
+ #include <media/media-entity.h>
++#include <media/media-request.h>
+ 
+ #ifdef CONFIG_MEDIA_CONTROLLER
+ 
+@@ -374,6 +375,15 @@ static long media_device_get_topology(struct media_device *mdev, void *arg)
+ 	return ret;
+ }
+ 
++static long media_device_request_alloc(struct media_device *mdev,
++				       struct media_request_alloc *alloc)
++{
++	if (!mdev->ops || !mdev->ops->req_validate || !mdev->ops->req_queue)
++		return -ENOTTY;
++
++	return media_request_alloc(mdev, alloc);
++}
++
+ static long copy_arg_from_user(void *karg, void __user *uarg, unsigned int cmd)
+ {
+ 	/* All media IOCTLs are _IOWR() */
+@@ -422,6 +432,7 @@ static const struct media_ioctl_info ioctl_info[] = {
+ 	MEDIA_IOC(ENUM_LINKS, media_device_enum_links, MEDIA_IOC_FL_GRAPH_MUTEX),
+ 	MEDIA_IOC(SETUP_LINK, media_device_setup_link, MEDIA_IOC_FL_GRAPH_MUTEX),
+ 	MEDIA_IOC(G_TOPOLOGY, media_device_get_topology, MEDIA_IOC_FL_GRAPH_MUTEX),
++	MEDIA_IOC(REQUEST_ALLOC, media_device_request_alloc, 0),
+ };
+ 
+ static long media_device_ioctl(struct file *filp, unsigned int cmd,
+@@ -694,6 +705,8 @@ void media_device_init(struct media_device *mdev)
+ 	INIT_LIST_HEAD(&mdev->pads);
+ 	INIT_LIST_HEAD(&mdev->links);
+ 	INIT_LIST_HEAD(&mdev->entity_notify);
++
++	mutex_init(&mdev->req_queue_mutex);
+ 	mutex_init(&mdev->graph_mutex);
+ 	ida_init(&mdev->entity_internal_idx);
+ 
+@@ -707,6 +720,7 @@ void media_device_cleanup(struct media_device *mdev)
+ 	mdev->entity_internal_idx_max = 0;
+ 	media_graph_walk_cleanup(&mdev->pm_count_walk);
+ 	mutex_destroy(&mdev->graph_mutex);
++	mutex_destroy(&mdev->req_queue_mutex);
+ }
+ EXPORT_SYMBOL_GPL(media_device_cleanup);
+ 
+diff --git a/drivers/media/media-request.c b/drivers/media/media-request.c
+new file mode 100644
+index 000000000000..253068f51a1f
+--- /dev/null
++++ b/drivers/media/media-request.c
+@@ -0,0 +1,423 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Media device request objects
++ *
++ * Copyright 2018 Cisco Systems, Inc. and/or its affiliates. All rights reserved.
++ * Copyright (C) 2018 Intel Corporation
++ * Copyright (C) 2018 Google, Inc.
++ *
++ * Author: Hans Verkuil <hans.verkuil@cisco.com>
++ * Author: Sakari Ailus <sakari.ailus@linux.intel.com>
++ */
++
++#include <linux/anon_inodes.h>
++#include <linux/file.h>
++#include <linux/refcount.h>
++
++#include <media/media-device.h>
++#include <media/media-request.h>
++
++static const char * const request_state[] = {
++	[MEDIA_REQUEST_STATE_IDLE]	 = "idle",
++	[MEDIA_REQUEST_STATE_VALIDATING] = "validating",
++	[MEDIA_REQUEST_STATE_QUEUED]	 = "queued",
++	[MEDIA_REQUEST_STATE_COMPLETE]	 = "complete",
++	[MEDIA_REQUEST_STATE_CLEANING]	 = "cleaning",
++	[MEDIA_REQUEST_STATE_UPDATING]	 = "updating",
++};
++
++static const char *
++media_request_state_str(enum media_request_state state)
++{
++	BUILD_BUG_ON(ARRAY_SIZE(request_state) != NR_OF_MEDIA_REQUEST_STATE);
++
++	if (WARN_ON(state >= ARRAY_SIZE(request_state)))
++		return "invalid";
++	return request_state[state];
++}
++
++static void media_request_clean(struct media_request *req)
++{
++	struct media_request_object *obj, *obj_safe;
++
++	/* Just a sanity check. No other code path is allowed to change this. */
++	WARN_ON(req->state != MEDIA_REQUEST_STATE_CLEANING);
++	WARN_ON(req->updating_count);
++
++	list_for_each_entry_safe(obj, obj_safe, &req->objects, list) {
++		media_request_object_unbind(obj);
++		media_request_object_put(obj);
++	}
++
++	req->updating_count = 0;
++	WARN_ON(req->num_incomplete_objects);
++	req->num_incomplete_objects = 0;
++	wake_up_interruptible_all(&req->poll_wait);
++}
++
++static void media_request_release(struct kref *kref)
++{
++	struct media_request *req =
++		container_of(kref, struct media_request, kref);
++	struct media_device *mdev = req->mdev;
++
++	dev_dbg(mdev->dev, "request: release %s\n", req->debug_str);
++
++	/* No other users, no need for a spinlock */
++	req->state = MEDIA_REQUEST_STATE_CLEANING;
++
++	media_request_clean(req);
++
++	if (mdev->ops->req_free)
++		mdev->ops->req_free(req);
++	else
++		kfree(req);
++}
++
++void media_request_put(struct media_request *req)
++{
++	kref_put(&req->kref, media_request_release);
++}
++EXPORT_SYMBOL_GPL(media_request_put);
++
++static int media_request_close(struct inode *inode, struct file *filp)
++{
++	struct media_request *req = filp->private_data;
++
++	media_request_put(req);
++	return 0;
++}
++
++static unsigned int media_request_poll(struct file *filp,
++				       struct poll_table_struct *wait)
++{
++	struct media_request *req = filp->private_data;
++	unsigned long flags;
++	unsigned int ret = 0;
++
++	if (!(poll_requested_events(wait) & POLLPRI))
++		return 0;
++
++	spin_lock_irqsave(&req->lock, flags);
++	if (req->state == MEDIA_REQUEST_STATE_COMPLETE) {
++		ret = POLLPRI;
++		goto unlock;
++	}
++	if (req->state != MEDIA_REQUEST_STATE_QUEUED) {
++		ret = POLLERR;
++		goto unlock;
++	}
++
++	poll_wait(filp, &req->poll_wait, wait);
++
++unlock:
++	spin_unlock_irqrestore(&req->lock, flags);
++	return ret;
++}
++
++static long media_request_ioctl_queue(struct media_request *req)
++{
++	struct media_device *mdev = req->mdev;
++	enum media_request_state state;
++	unsigned long flags;
++	int ret;
++
++	dev_dbg(mdev->dev, "request: queue %s\n", req->debug_str);
++
++	/*
++	 * Ensure the request that is validated will be the one that gets queued
++	 * next by serialising the queueing process. This mutex is also used
++	 * to serialize with canceling a vb2 queue and with setting values such
++	 * as controls in a request.
++	 */
++	mutex_lock(&mdev->req_queue_mutex);
++
++	media_request_get(req);
++
++	spin_lock_irqsave(&req->lock, flags);
++	if (req->state == MEDIA_REQUEST_STATE_IDLE)
++		req->state = MEDIA_REQUEST_STATE_VALIDATING;
++	state = req->state;
++	spin_unlock_irqrestore(&req->lock, flags);
++	if (state != MEDIA_REQUEST_STATE_VALIDATING) {
++		dev_dbg(mdev->dev,
++			"request: unable to queue %s, request in state %s\n",
++			req->debug_str, media_request_state_str(state));
++		mutex_unlock(&mdev->req_queue_mutex);
++		return -EBUSY;
++	}
++
++	ret = mdev->ops->req_validate(req);
++
++	/*
++	 * If the req_validate was successful, then we mark the state as QUEUED
++	 * and call req_queue. The reason we set the state first is that this
++	 * allows req_queue to unbind or complete the queued objects in case
++	 * they are immediately 'consumed'. State changes from QUEUED to another
++	 * state can only happen if either the driver changes the state or if
++	 * the user cancels the vb2 queue. The driver can only change the state
++	 * after each object is queued through the req_queue op (and note that
++	 * that op cannot fail), so setting the state to QUEUED up front is
++	 * safe.
++	 *
++	 * The other reason for changing the state is if the vb2 queue is
++	 * canceled, and that uses the req_queue_mutex which is still locked
++	 * while req_queue is called, so that's safe as well.
++	 */
++	spin_lock_irqsave(&req->lock, flags);
++	req->state = ret ? MEDIA_REQUEST_STATE_IDLE
++			 : MEDIA_REQUEST_STATE_QUEUED;
++	spin_unlock_irqrestore(&req->lock, flags);
++
++	if (!ret)
++		mdev->ops->req_queue(req);
++
++	mutex_unlock(&mdev->req_queue_mutex);
++
++	if (ret) {
++		dev_dbg(mdev->dev, "request: can't queue %s (%d)\n",
++			req->debug_str, ret);
++		media_request_put(req);
++	}
++
++	return ret;
++}
++
++static long media_request_ioctl_reinit(struct media_request *req)
++{
++	struct media_device *mdev = req->mdev;
++	unsigned long flags;
++
++	spin_lock_irqsave(&req->lock, flags);
++	if (req->state != MEDIA_REQUEST_STATE_IDLE &&
++	    req->state != MEDIA_REQUEST_STATE_COMPLETE) {
++		dev_dbg(mdev->dev,
++			"request: %s not in idle or complete state, cannot reinit\n",
++			req->debug_str);
++		spin_unlock_irqrestore(&req->lock, flags);
++		return -EBUSY;
++	}
++	req->state = MEDIA_REQUEST_STATE_CLEANING;
++	spin_unlock_irqrestore(&req->lock, flags);
++
++	media_request_clean(req);
++
++	spin_lock_irqsave(&req->lock, flags);
++	req->state = MEDIA_REQUEST_STATE_IDLE;
++	spin_unlock_irqrestore(&req->lock, flags);
++
++	return 0;
++}
++
++static long media_request_ioctl(struct file *filp, unsigned int cmd,
++				unsigned long arg)
++{
++	struct media_request *req = filp->private_data;
++
++	switch (cmd) {
++	case MEDIA_REQUEST_IOC_QUEUE:
++		return media_request_ioctl_queue(req);
++	case MEDIA_REQUEST_IOC_REINIT:
++		return media_request_ioctl_reinit(req);
++	default:
++		return -ENOIOCTLCMD;
++	}
++}
++
++static const struct file_operations request_fops = {
++	.owner = THIS_MODULE,
++	.poll = media_request_poll,
++	.unlocked_ioctl = media_request_ioctl,
++	.release = media_request_close,
++};
++
++int media_request_alloc(struct media_device *mdev,
++			struct media_request_alloc *alloc)
++{
++	struct media_request *req;
++	struct file *filp;
++	char comm[TASK_COMM_LEN];
++	int fd;
++	int ret;
++
++	/* Either both are NULL or both are non-NULL */
++	if (WARN_ON(!mdev->ops->req_alloc ^ !mdev->ops->req_free))
++		return -ENOMEM;
++
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0)
++		return fd;
++
++	filp = anon_inode_getfile("request", &request_fops, NULL, O_CLOEXEC);
++	if (IS_ERR(filp)) {
++		ret = PTR_ERR(filp);
++		goto err_put_fd;
++	}
++
++	if (mdev->ops->req_alloc)
++		req = mdev->ops->req_alloc(mdev);
++	else
++		req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req) {
++		ret = -ENOMEM;
++		goto err_fput;
++	}
++
++	filp->private_data = req;
++	req->mdev = mdev;
++	req->state = MEDIA_REQUEST_STATE_IDLE;
++	req->num_incomplete_objects = 0;
++	kref_init(&req->kref);
++	INIT_LIST_HEAD(&req->objects);
++	spin_lock_init(&req->lock);
++	init_waitqueue_head(&req->poll_wait);
++	req->updating_count = 0;
++
++	alloc->fd = fd;
++
++	get_task_comm(comm, current);
++	snprintf(req->debug_str, sizeof(req->debug_str), "%s:%d",
++		 comm, fd);
++	dev_dbg(mdev->dev, "request: allocated %s\n", req->debug_str);
++
++	fd_install(fd, filp);
++
++	return 0;
++
++err_fput:
++	fput(filp);
++
++err_put_fd:
++	put_unused_fd(fd);
++
++	return ret;
++}
++
++static void media_request_object_release(struct kref *kref)
++{
++	struct media_request_object *obj =
++		container_of(kref, struct media_request_object, kref);
++	struct media_request *req = obj->req;
++
++	if (WARN_ON(req))
++		media_request_object_unbind(obj);
++	obj->ops->release(obj);
++}
++
++void media_request_object_put(struct media_request_object *obj)
++{
++	kref_put(&obj->kref, media_request_object_release);
++}
++EXPORT_SYMBOL_GPL(media_request_object_put);
++
++void media_request_object_init(struct media_request_object *obj)
++{
++	obj->ops = NULL;
++	obj->req = NULL;
++	obj->priv = NULL;
++	obj->completed = false;
++	INIT_LIST_HEAD(&obj->list);
++	kref_init(&obj->kref);
++}
++EXPORT_SYMBOL_GPL(media_request_object_init);
++
++int media_request_object_bind(struct media_request *req,
++			      const struct media_request_object_ops *ops,
++			      void *priv,
++			      struct media_request_object *obj)
++{
++	unsigned long flags;
++	int ret = -EBUSY;
++
++	if (WARN_ON(!ops->release))
++		return -EPERM;
++
++	spin_lock_irqsave(&req->lock, flags);
++
++	if (WARN_ON(req->state != MEDIA_REQUEST_STATE_UPDATING))
++		goto unlock;
++
++	obj->req = req;
++	obj->ops = ops;
++	obj->priv = priv;
++
++	list_add_tail(&obj->list, &req->objects);
++	req->num_incomplete_objects++;
++	ret = 0;
++
++unlock:
++	spin_unlock_irqrestore(&req->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(media_request_object_bind);
++
++void media_request_object_unbind(struct media_request_object *obj)
++{
++	struct media_request *req = obj->req;
++	unsigned long flags;
++	bool completed = false;
++
++	if (WARN_ON(!req))
++		return;
++
++	spin_lock_irqsave(&req->lock, flags);
++	list_del(&obj->list);
++	obj->req = NULL;
++
++	if (req->state == MEDIA_REQUEST_STATE_COMPLETE)
++		goto unlock;
++
++	if (WARN_ON(req->state == MEDIA_REQUEST_STATE_VALIDATING))
++		goto unlock;
++
++	if (req->state == MEDIA_REQUEST_STATE_CLEANING) {
++		if (!obj->completed)
++			req->num_incomplete_objects--;
++		goto unlock;
++	}
++
++	if (WARN_ON(!req->num_incomplete_objects))
++		goto unlock;
++
++	req->num_incomplete_objects--;
++	if (req->state == MEDIA_REQUEST_STATE_QUEUED &&
++	    !req->num_incomplete_objects) {
++		req->state = MEDIA_REQUEST_STATE_COMPLETE;
++		completed = true;
++		wake_up_interruptible_all(&req->poll_wait);
++	}
++
++unlock:
++	spin_unlock_irqrestore(&req->lock, flags);
++	if (obj->ops->unbind)
++		obj->ops->unbind(obj);
++	if (completed)
++		media_request_put(req);
++}
++EXPORT_SYMBOL_GPL(media_request_object_unbind);
++
++void media_request_object_complete(struct media_request_object *obj)
++{
++	struct media_request *req = obj->req;
++	unsigned long flags;
++	bool completed = false;
++
++	spin_lock_irqsave(&req->lock, flags);
++	if (obj->completed)
++		goto unlock;
++	obj->completed = true;
++	if (WARN_ON(!req->num_incomplete_objects) ||
++	    WARN_ON(req->state != MEDIA_REQUEST_STATE_QUEUED))
++		goto unlock;
++
++	if (!--req->num_incomplete_objects) {
++		req->state = MEDIA_REQUEST_STATE_COMPLETE;
++		wake_up_interruptible_all(&req->poll_wait);
++		completed = true;
++	}
++unlock:
++	spin_unlock_irqrestore(&req->lock, flags);
++	if (completed)
++		media_request_put(req);
++}
++EXPORT_SYMBOL_GPL(media_request_object_complete);
+diff --git a/include/media/media-device.h b/include/media/media-device.h
+index bcc6ec434f1f..110b89567671 100644
+--- a/include/media/media-device.h
++++ b/include/media/media-device.h
+@@ -27,6 +27,7 @@
+ 
+ struct ida;
+ struct device;
++struct media_device;
+ 
+ /**
+  * struct media_entity_notify - Media Entity Notify
+@@ -50,10 +51,26 @@ struct media_entity_notify {
+  * struct media_device_ops - Media device operations
+  * @link_notify: Link state change notification callback. This callback is
+  *		 called with the graph_mutex held.
++ * @req_alloc: Allocate a request. Set this if you need to allocate a struct
++ *	       larger then struct media_request. @req_alloc and @req_free must
++ *	       either both be set or both be NULL.
++ * @req_free: Free a request. Set this if @req_alloc was set as well, leave
++ *	      to NULL otherwise.
++ * @req_validate: Validate a request, but do not queue yet. The req_queue_mutex
++ *	          lock is held when this op is called.
++ * @req_queue: Queue a validated request, cannot fail. If something goes
++ *	       wrong when queueing this request then it should be marked
++ *	       as such internally in the driver and any related buffers
++ *	       must eventually return to vb2 with state VB2_BUF_STATE_ERROR.
++ *	       The req_queue_mutex lock is held when this op is called.
+  */
+ struct media_device_ops {
+ 	int (*link_notify)(struct media_link *link, u32 flags,
+ 			   unsigned int notification);
++	struct media_request *(*req_alloc)(struct media_device *mdev);
++	void (*req_free)(struct media_request *req);
++	int (*req_validate)(struct media_request *req);
++	void (*req_queue)(struct media_request *req);
+ };
+ 
+ /**
+@@ -88,6 +105,8 @@ struct media_device_ops {
+  * @disable_source: Disable Source Handler function pointer
+  *
+  * @ops:	Operation handler callbacks
++ * @req_queue_mutex: Serialise the MEDIA_REQUEST_IOC_QUEUE ioctl w.r.t.
++ *		     other operations that stop or start streaming.
+  *
+  * This structure represents an abstract high-level media device. It allows easy
+  * access to entities and provides basic media device-level support. The
+@@ -158,6 +177,8 @@ struct media_device {
+ 	void (*disable_source)(struct media_entity *entity);
+ 
+ 	const struct media_device_ops *ops;
++
++	struct mutex req_queue_mutex;
+ };
+ 
+ /* We don't need to include pci.h or usb.h here */
+diff --git a/include/media/media-request.h b/include/media/media-request.h
+new file mode 100644
+index 000000000000..fe5a04fb970c
+--- /dev/null
++++ b/include/media/media-request.h
+@@ -0,0 +1,327 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Media device request objects
++ *
++ * Copyright 2018 Cisco Systems, Inc. and/or its affiliates. All rights reserved.
++ * Copyright (C) 2018 Intel Corporation
++ *
++ * Author: Hans Verkuil <hans.verkuil@cisco.com>
++ * Author: Sakari Ailus <sakari.ailus@linux.intel.com>
++ */
++
++#ifndef MEDIA_REQUEST_H
++#define MEDIA_REQUEST_H
++
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/refcount.h>
++
++#include <media/media-device.h>
++
++/**
++ * enum media_request_state - media request state
++ *
++ * @MEDIA_REQUEST_STATE_IDLE:		Idle
++ * @MEDIA_REQUEST_STATE_VALIDATING:	Validating the request, no state changes
++ *					allowed
++ * @MEDIA_REQUEST_STATE_QUEUED:		Queued
++ * @MEDIA_REQUEST_STATE_COMPLETE:	Completed, the request is done
++ * @MEDIA_REQUEST_STATE_CLEANING:	Cleaning, the request is being re-inited
++ * @MEDIA_REQUEST_STATE_UPDATING:	The request is being updated, i.e.
++ *					request objects are being added,
++ *					modified or removed
++ * @NR_OF_MEDIA_REQUEST_STATE:		The number of media request states, used
++ *					internally for sanity check purposes
++ */
++enum media_request_state {
++	MEDIA_REQUEST_STATE_IDLE,
++	MEDIA_REQUEST_STATE_VALIDATING,
++	MEDIA_REQUEST_STATE_QUEUED,
++	MEDIA_REQUEST_STATE_COMPLETE,
++	MEDIA_REQUEST_STATE_CLEANING,
++	MEDIA_REQUEST_STATE_UPDATING,
++	NR_OF_MEDIA_REQUEST_STATE,
++};
++
++struct media_request_object;
++
++/**
++ * struct media_request - Media device request
++ * @mdev: Media device this request belongs to
++ * @kref: Reference count
++ * @debug_str: Prefix for debug messages (process name:fd)
++ * @state: The state of the request
++ * @updating_count: count the number of request updates that are in progress
++ * @objects: List of @struct media_request_object request objects
++ * @num_incomplete_objects: The number of incomplete objects in the request
++ * @poll_wait: Wait queue for poll
++ * @lock: Serializes access to this struct
++ */
++struct media_request {
++	struct media_device *mdev;
++	struct kref kref;
++	char debug_str[TASK_COMM_LEN + 11];
++	enum media_request_state state;
++	unsigned int updating_count;
++	struct list_head objects;
++	unsigned int num_incomplete_objects;
++	struct wait_queue_head poll_wait;
++	spinlock_t lock;
++};
++
++#ifdef CONFIG_MEDIA_CONTROLLER
++
++/**
++ * media_request_lock_for_update - Lock the request for updating its objects
++ *
++ * @req: The media request
++ *
++ * Use before updating a request, i.e. adding, modifying or removing a request
++ * object in it. A reference to the request must be held during the update. This
++ * usually takes place automatically through a file handle. Use
++ * @media_request_unlock_for_update when done.
++ */
++static inline int __must_check
++media_request_lock_for_update(struct media_request *req)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&req->lock, flags);
++	if (req->state == MEDIA_REQUEST_STATE_IDLE ||
++	    req->state == MEDIA_REQUEST_STATE_UPDATING) {
++		req->state = MEDIA_REQUEST_STATE_UPDATING;
++		req->updating_count++;
++	} else {
++		ret = -EBUSY;
++	}
++	spin_unlock_irqrestore(&req->lock, flags);
++
++	return ret;
++}
++
++/**
++ * media_request_unlock_for_update - Unlock a request previously locked for
++ *				     update
++ *
++ * @req: The media request
++ *
++ * Unlock a request that has previously been locked using
++ * @media_request_lock_for_update.
++ */
++static inline void media_request_unlock_for_update(struct media_request *req)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&req->lock, flags);
++	WARN_ON(req->updating_count <= 0);
++	if (!--req->updating_count)
++		req->state = MEDIA_REQUEST_STATE_IDLE;
++	spin_unlock_irqrestore(&req->lock, flags);
++}
++
++/**
++ * media_request_get - Get the media request
++ *
++ * @req: The media request
++ *
++ * Get the media request.
++ */
++static inline void media_request_get(struct media_request *req)
++{
++	kref_get(&req->kref);
++}
++
++/**
++ * media_request_put - Put the media request
++ *
++ * @req: The media request
++ *
++ * Put the media request. The media request will be released
++ * when the refcount reaches 0.
++ */
++void media_request_put(struct media_request *req);
++
++/**
++ * media_request_alloc - Allocate the media request
++ *
++ * @mdev: Media device this request belongs to
++ * @alloc: Store the request's file descriptor in this struct
++ *
++ * Allocated the media request and put the fd in @alloc->fd.
++ */
++int media_request_alloc(struct media_device *mdev,
++			struct media_request_alloc *alloc);
++
++#else
++
++static inline void media_request_get(struct media_request *req)
++{
++}
++
++static inline void media_request_put(struct media_request *req)
++{
++}
++
++#endif
++
++/**
++ * struct media_request_object_ops - Media request object operations
++ * @prepare: Validate and prepare the request object, optional.
++ * @unprepare: Unprepare the request object, optional.
++ * @queue: Queue the request object, optional.
++ * @unbind: Unbind the request object, optional.
++ * @release: Release the request object, required.
++ */
++struct media_request_object_ops {
++	int (*prepare)(struct media_request_object *object);
++	void (*unprepare)(struct media_request_object *object);
++	void (*queue)(struct media_request_object *object);
++	void (*unbind)(struct media_request_object *object);
++	void (*release)(struct media_request_object *object);
++};
++
++/**
++ * struct media_request_object - An opaque object that belongs to a media
++ *				 request
++ *
++ * @ops: object's operations
++ * @priv: object's priv pointer
++ * @req: the request this object belongs to (can be NULL)
++ * @list: List entry of the object for @struct media_request
++ * @kref: Reference count of the object, acquire before releasing req->lock
++ * @completed: If true, then this object was completed.
++ *
++ * An object related to the request. This struct is always embedded in
++ * another struct that contains the actual data for this request object.
++ */
++struct media_request_object {
++	const struct media_request_object_ops *ops;
++	void *priv;
++	struct media_request *req;
++	struct list_head list;
++	struct kref kref;
++	bool completed;
++};
++
++#ifdef CONFIG_MEDIA_CONTROLLER
++
++/**
++ * media_request_object_get - Get a media request object
++ *
++ * @obj: The object
++ *
++ * Get a media request object.
++ */
++static inline void media_request_object_get(struct media_request_object *obj)
++{
++	kref_get(&obj->kref);
++}
++
++/**
++ * media_request_object_put - Put a media request object
++ *
++ * @obj: The object
++ *
++ * Put a media request object. Once all references are gone, the
++ * object's memory is released.
++ */
++void media_request_object_put(struct media_request_object *obj);
++
++/**
++ * media_request_object_init - Initialise a media request object
++ *
++ * @obj: The object
++ *
++ * Initialise a media request object. The object will be released using the
++ * release callback of the ops once it has no references (this function
++ * initialises references to one).
++ */
++void media_request_object_init(struct media_request_object *obj);
++
++/**
++ * media_request_object_bind - Bind a media request object to a request
++ *
++ * @req: The media request
++ * @ops: The object ops for this object
++ * @priv: A driver-specific priv pointer associated with this object
++ * @obj: The object
++ *
++ * Bind this object to the request and set the ops and priv values of
++ * the object so it can be found later with media_request_object_find().
++ *
++ * Every bound object must be unbound or completed by the kernel at some
++ * point in time, otherwise the request will never complete. When the
++ * request is released all completed objects will be unbound by the
++ * request core code.
++ */
++int media_request_object_bind(struct media_request *req,
++			      const struct media_request_object_ops *ops,
++			      void *priv,
++			      struct media_request_object *obj);
++
++/**
++ * media_request_object_unbind - Unbind a media request object
++ *
++ * @obj: The object
++ *
++ * Unbind the media request object from the request.
++ */
++void media_request_object_unbind(struct media_request_object *obj);
++
++/**
++ * media_request_object_complete - Mark the media request object as complete
++ *
++ * @obj: The object
++ *
++ * Mark the media request object as complete. Only bound objects can
++ * be completed.
++ */
++void media_request_object_complete(struct media_request_object *obj);
++
++#else
++
++static inline int __must_check
++media_request_lock_for_update(struct media_request *req)
++{
++	return -EINVAL;
++}
++
++static inline void media_request_unlock_for_update(struct media_request *req)
++{
++}
++
++static inline void media_request_object_get(struct media_request_object *obj)
++{
++}
++
++static inline void media_request_object_put(struct media_request_object *obj)
++{
++}
++
++static inline void media_request_object_init(struct media_request_object *obj)
++{
++	obj->ops = NULL;
++	obj->req = NULL;
++}
++
++static inline int media_request_object_bind(struct media_request *req,
++			       const struct media_request_object_ops *ops,
++			       void *priv,
++			       struct media_request_object *obj)
++{
++	return 0;
++}
++
++static inline void media_request_object_unbind(struct media_request_object *obj)
++{
++}
++
++static inline void media_request_object_complete(struct media_request_object *obj)
++{
++}
++
++#endif
++
++#endif
+-- 
+2.18.0
+
+From da19ddd23824344c547ebb1841fd07adfa4e11cd Mon Sep 17 00:00:00 2001
+From: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date: Mon, 21 May 2018 11:54:33 +0300
+Subject: [PATCH 04/34] media: doc: Add media-request.h header to documentation
+ build
+
+media-request.h has been recently added; add it to the documentation build
+as well.
+
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ Documentation/media/kapi/mc-core.rst | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Documentation/media/kapi/mc-core.rst b/Documentation/media/kapi/mc-core.rst
+index 0c05503eaf1f..69362b3135c2 100644
+--- a/Documentation/media/kapi/mc-core.rst
++++ b/Documentation/media/kapi/mc-core.rst
+@@ -262,3 +262,5 @@ in the end provide a way to use driver-specific callbacks.
+ .. kernel-doc:: include/media/media-devnode.h
+ 
+ .. kernel-doc:: include/media/media-entity.h
++
++.. kernel-doc:: include/media/media-request.h
+-- 
+2.18.0
+
+From fd8a4e10f6e29450303118f7abc87838e859d845 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:28 +0300
+Subject: [PATCH 05/34] media-request: add media_request_get_by_fd
+
+Add media_request_get_by_fd() to find a request based on the file
+descriptor.
+
+The caller has to call media_request_put() for the returned
+request since this function increments the refcount.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+---
+ drivers/media/media-request.c | 40 +++++++++++++++++++++++++++++++++++
+ include/media/media-request.h | 24 +++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/drivers/media/media-request.c b/drivers/media/media-request.c
+index 253068f51a1f..4b523f3a03a3 100644
+--- a/drivers/media/media-request.c
++++ b/drivers/media/media-request.c
+@@ -231,6 +231,46 @@ static const struct file_operations request_fops = {
+ 	.release = media_request_close,
+ };
+ 
++struct media_request *
++media_request_get_by_fd(struct media_device *mdev, int request_fd)
++{
++	struct file *filp;
++	struct media_request *req;
++
++	if (!mdev || !mdev->ops ||
++	    !mdev->ops->req_validate || !mdev->ops->req_queue)
++		return ERR_PTR(-EPERM);
++
++	filp = fget(request_fd);
++	if (!filp)
++		return ERR_PTR(-ENOENT);
++
++	if (filp->f_op != &request_fops)
++		goto err_fput;
++	req = filp->private_data;
++	if (req->mdev != mdev)
++		goto err_fput;
++
++	/*
++	 * Note: as long as someone has an open filehandle of the request,
++	 * the request can never be released. The fget() above ensures that
++	 * even if userspace closes the request filehandle, the release()
++	 * fop won't be called, so the media_request_get() always succeeds
++	 * and there is no race condition where the request was released
++	 * before media_request_get() is called.
++	 */
++	media_request_get(req);
++	fput(filp);
++
++	return req;
++
++err_fput:
++	fput(filp);
++
++	return ERR_PTR(-ENOENT);
++}
++EXPORT_SYMBOL_GPL(media_request_get_by_fd);
++
+ int media_request_alloc(struct media_device *mdev,
+ 			struct media_request_alloc *alloc)
+ {
+diff --git a/include/media/media-request.h b/include/media/media-request.h
+index fe5a04fb970c..66ec9d09fcd8 100644
+--- a/include/media/media-request.h
++++ b/include/media/media-request.h
+@@ -143,6 +143,24 @@ static inline void media_request_get(struct media_request *req)
+  */
+ void media_request_put(struct media_request *req);
+ 
++/**
++ * media_request_get_by_fd - Get a media request by fd
++ *
++ * @mdev: Media device this request belongs to
++ * @request_fd: The file descriptor of the request
++ *
++ * Get the request represented by @request_fd that is owned
++ * by the media device.
++ *
++ * Return a -EPERM error pointer if requests are not supported
++ * by this driver. Return -ENOENT if the request was not found.
++ * Return the pointer to the request if found: the caller will
++ * have to call @media_request_put when it finished using the
++ * request.
++ */
++struct media_request *
++media_request_get_by_fd(struct media_device *mdev, int request_fd);
++
+ /**
+  * media_request_alloc - Allocate the media request
+  *
+@@ -164,6 +182,12 @@ static inline void media_request_put(struct media_request *req)
+ {
+ }
+ 
++static inline struct media_request *
++media_request_get_by_fd(struct media_device *mdev, int request_fd)
++{
++	return ERR_PTR(-EPERM);
++}
++
+ #endif
+ 
+ /**
+-- 
+2.18.0
+
+From 82b9f9db666956a960738532814faabdce2cf14e Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:29 +0300
+Subject: [PATCH 06/34] media-request: add media_request_object_find
+
+Add media_request_object_find to find a request object inside a
+request based on ops and priv values.
+
+Objects of the same type (vb2 buffer, control handler) will have
+the same ops value. And objects that refer to the same 'parent'
+object (e.g. the v4l2_ctrl_handler that has the current driver
+state) will have the same priv value.
+
+The caller has to call media_request_object_put() for the returned
+object since this function increments the refcount.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+---
+ drivers/media/media-request.c | 25 +++++++++++++++++++++++++
+ include/media/media-request.h | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/drivers/media/media-request.c b/drivers/media/media-request.c
+index 4b523f3a03a3..a5b70a4e613b 100644
+--- a/drivers/media/media-request.c
++++ b/drivers/media/media-request.c
+@@ -344,6 +344,31 @@ static void media_request_object_release(struct kref *kref)
+ 	obj->ops->release(obj);
+ }
+ 
++struct media_request_object *
++media_request_object_find(struct media_request *req,
++			  const struct media_request_object_ops *ops,
++			  void *priv)
++{
++	struct media_request_object *obj;
++	struct media_request_object *found = NULL;
++	unsigned long flags;
++
++	if (WARN_ON(!ops || !priv))
++		return NULL;
++
++	spin_lock_irqsave(&req->lock, flags);
++	list_for_each_entry(obj, &req->objects, list) {
++		if (obj->ops == ops && obj->priv == priv) {
++			media_request_object_get(obj);
++			found = obj;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&req->lock, flags);
++	return found;
++}
++EXPORT_SYMBOL_GPL(media_request_object_find);
++
+ void media_request_object_put(struct media_request_object *obj)
+ {
+ 	kref_put(&obj->kref, media_request_object_release);
+diff --git a/include/media/media-request.h b/include/media/media-request.h
+index 66ec9d09fcd8..fd08d7a431a1 100644
+--- a/include/media/media-request.h
++++ b/include/media/media-request.h
+@@ -253,6 +253,26 @@ static inline void media_request_object_get(struct media_request_object *obj)
+  */
+ void media_request_object_put(struct media_request_object *obj);
+ 
++/**
++ * media_request_object_find - Find an object in a request
++ *
++ * @req: The media request
++ * @ops: Find an object with this ops value
++ * @priv: Find an object with this priv value
++ *
++ * Both @ops and @priv must be non-NULL.
++ *
++ * Returns the object pointer or NULL if not found. The caller must
++ * call media_request_object_put() once it finished using the object.
++ *
++ * Since this function needs to walk the list of objects it takes
++ * the @req->lock spin lock to make this safe.
++ */
++struct media_request_object *
++media_request_object_find(struct media_request *req,
++			  const struct media_request_object_ops *ops,
++			  void *priv);
++
+ /**
+  * media_request_object_init - Initialise a media request object
+  *
+@@ -324,6 +344,14 @@ static inline void media_request_object_put(struct media_request_object *obj)
+ {
+ }
+ 
++static inline struct media_request_object *
++media_request_object_find(struct media_request *req,
++			  const struct media_request_object_ops *ops,
++			  void *priv)
++{
++	return NULL;
++}
++
+ static inline void media_request_object_init(struct media_request_object *obj)
+ {
+ 	obj->ops = NULL;
+-- 
+2.18.0
+
+From c2e732700cdb4ac199682b675b42f37a16471b63 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Wed, 23 May 2018 13:11:06 +0200
+Subject: [PATCH 07/34] v4l2-device.h: add v4l2_device_supports_requests()
+ helper
+
+Add a simple helper function that tests if the driver supports
+the request API.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ include/media/v4l2-device.h | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/include/media/v4l2-device.h b/include/media/v4l2-device.h
+index b330e4a08a6b..ac7677a183ff 100644
+--- a/include/media/v4l2-device.h
++++ b/include/media/v4l2-device.h
+@@ -211,6 +211,17 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
+ 		sd->v4l2_dev->notify(sd, notification, arg);
+ }
+ 
++/**
++ * v4l2_device_supports_requests - Test if requests are supported.
++ *
++ * @v4l2_dev: pointer to struct v4l2_device
++ */
++static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
++{
++	return v4l2_dev->mdev && v4l2_dev->mdev->ops &&
++	       v4l2_dev->mdev->ops->req_queue;
++}
++
+ /* Helper macros to iterate over all subdevs. */
+ 
+ /**
+-- 
+2.18.0
+
+From 91a1ce48a292bdf748d87c39aafc00bae80a36e4 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:34 +0300
+Subject: [PATCH 08/34] v4l2-dev: lock req_queue_mutex
+
+We need to serialize streamon/off with queueing new requests.
+These ioctls may trigger the cancellation of a streaming
+operation, and that should not be mixed with queuing a new
+request at the same time.
+
+Finally close() needs this lock since that too can trigger the
+cancellation of a streaming operation.
+
+We take the req_queue_mutex here before any other locks since
+it is a very high-level lock.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+---
+ drivers/media/v4l2-core/v4l2-dev.c   | 13 +++++++++++++
+ drivers/media/v4l2-core/v4l2-ioctl.c | 22 +++++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-dev.c b/drivers/media/v4l2-core/v4l2-dev.c
+index 69e775930fc4..53018e4a4c78 100644
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -444,8 +444,21 @@ static int v4l2_release(struct inode *inode, struct file *filp)
+ 	struct video_device *vdev = video_devdata(filp);
+ 	int ret = 0;
+ 
++	/*
++	 * We need to serialize the release() with queueing new requests.
++	 * The release() may trigger the cancellation of a streaming
++	 * operation, and that should not be mixed with queueing a new
++	 * request at the same time.
++	 */
++	if (v4l2_device_supports_requests(vdev->v4l2_dev))
++		mutex_lock(&vdev->v4l2_dev->mdev->req_queue_mutex);
++
+ 	if (vdev->fops->release)
+ 		ret = vdev->fops->release(filp);
++
++	if (v4l2_device_supports_requests(vdev->v4l2_dev))
++		mutex_unlock(&vdev->v4l2_dev->mdev->req_queue_mutex);
++
+ 	if (vdev->dev_debug & V4L2_DEV_DEBUG_FOP)
+ 		dprintk("%s: release\n",
+ 			video_device_node_name(vdev));
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 01670567641a..702ec4453790 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2774,6 +2774,7 @@ static long __video_do_ioctl(struct file *file,
+ 		unsigned int cmd, void *arg)
+ {
+ 	struct video_device *vfd = video_devdata(file);
++	struct mutex *req_queue_lock = NULL;
+ 	struct mutex *lock; /* ioctl serialization mutex */
+ 	const struct v4l2_ioctl_ops *ops = vfd->ioctl_ops;
+ 	bool write_only = false;
+@@ -2793,10 +2794,27 @@ static long __video_do_ioctl(struct file *file,
+ 	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
+ 		vfh = file->private_data;
+ 
++	/*
++	 * We need to serialize streamon/off with queueing new requests.
++	 * These ioctls may trigger the cancellation of a streaming
++	 * operation, and that should not be mixed with queueing a new
++	 * request at the same time.
++	 */
++	if (v4l2_device_supports_requests(vfd->v4l2_dev) &&
++	    (cmd == VIDIOC_STREAMON || cmd == VIDIOC_STREAMOFF)) {
++		req_queue_lock = &vfd->v4l2_dev->mdev->req_queue_mutex;
++
++		if (mutex_lock_interruptible(req_queue_lock))
++			return -ERESTARTSYS;
++	}
++
+ 	lock = v4l2_ioctl_get_lock(vfd, vfh, cmd, arg);
+ 
+-	if (lock && mutex_lock_interruptible(lock))
++	if (lock && mutex_lock_interruptible(lock)) {
++		if (req_queue_lock)
++			mutex_unlock(req_queue_lock);
+ 		return -ERESTARTSYS;
++	}
+ 
+ 	if (!video_is_registered(vfd)) {
+ 		ret = -ENODEV;
+@@ -2855,6 +2873,8 @@ static long __video_do_ioctl(struct file *file,
+ unlock:
+ 	if (lock)
+ 		mutex_unlock(lock);
++	if (req_queue_lock)
++		mutex_unlock(req_queue_lock);
+ 	return ret;
+ }
+ 
+-- 
+2.18.0
+
+From e9209aa0481a7cb7eb53f397376cf287de25ea09 Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@chromium.org>
+Date: Mon, 21 May 2018 11:54:35 +0300
+Subject: [PATCH 09/34] videodev2.h: add request_fd field to v4l2_ext_controls
+
+If 'which' is V4L2_CTRL_WHICH_REQUEST_VAL, then the 'request_fd' field
+can be used to specify a request for the G/S/TRY_EXT_CTRLS ioctls.
+
+Signed-off-by: Alexandre Courbot <acourbot@chromium.org>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-compat-ioctl32.c | 5 ++++-
+ drivers/media/v4l2-core/v4l2-ioctl.c          | 6 +++---
+ include/uapi/linux/videodev2.h                | 4 +++-
+ 3 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+index 6481212fda77..dcce86c1fe40 100644
+--- a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
++++ b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+@@ -834,7 +834,8 @@ struct v4l2_ext_controls32 {
+ 	__u32 which;
+ 	__u32 count;
+ 	__u32 error_idx;
+-	__u32 reserved[2];
++	__s32 request_fd;
++	__u32 reserved[1];
+ 	compat_caddr_t controls; /* actually struct v4l2_ext_control32 * */
+ };
+ 
+@@ -909,6 +910,7 @@ static int get_v4l2_ext_controls32(struct file *file,
+ 	    get_user(count, &p32->count) ||
+ 	    put_user(count, &p64->count) ||
+ 	    assign_in_user(&p64->error_idx, &p32->error_idx) ||
++	    assign_in_user(&p64->request_fd, &p32->request_fd) ||
+ 	    copy_in_user(p64->reserved, p32->reserved, sizeof(p64->reserved)))
+ 		return -EFAULT;
+ 
+@@ -974,6 +976,7 @@ static int put_v4l2_ext_controls32(struct file *file,
+ 	    get_user(count, &p64->count) ||
+ 	    put_user(count, &p32->count) ||
+ 	    assign_in_user(&p32->error_idx, &p64->error_idx) ||
++	    assign_in_user(&p32->request_fd, &p64->request_fd) ||
+ 	    copy_in_user(p32->reserved, p64->reserved, sizeof(p32->reserved)) ||
+ 	    get_user(kcontrols, &p64->controls))
+ 		return -EFAULT;
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 702ec4453790..cb3a7cf5d9d5 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -590,8 +590,8 @@ static void v4l_print_ext_controls(const void *arg, bool write_only)
+ 	const struct v4l2_ext_controls *p = arg;
+ 	int i;
+ 
+-	pr_cont("which=0x%x, count=%d, error_idx=%d",
+-			p->which, p->count, p->error_idx);
++	pr_cont("which=0x%x, count=%d, error_idx=%d, request_fd=%d",
++			p->which, p->count, p->error_idx, p->request_fd);
+ 	for (i = 0; i < p->count; i++) {
+ 		if (!p->controls[i].size)
+ 			pr_cont(", id/val=0x%x/0x%x",
+@@ -907,7 +907,7 @@ static int check_ext_ctrls(struct v4l2_ext_controls *c, int allow_priv)
+ 	__u32 i;
+ 
+ 	/* zero the reserved fields */
+-	c->reserved[0] = c->reserved[1] = 0;
++	c->reserved[0] = 0;
+ 	for (i = 0; i < c->count; i++)
+ 		c->controls[i].reserved2[0] = 0;
+ 
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 600877be5c22..16b53b82496c 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1592,7 +1592,8 @@ struct v4l2_ext_controls {
+ 	};
+ 	__u32 count;
+ 	__u32 error_idx;
+-	__u32 reserved[2];
++	__s32 request_fd;
++	__u32 reserved[1];
+ 	struct v4l2_ext_control *controls;
+ };
+ 
+@@ -1605,6 +1606,7 @@ struct v4l2_ext_controls {
+ #define V4L2_CTRL_MAX_DIMS	  (4)
+ #define V4L2_CTRL_WHICH_CUR_VAL   0
+ #define V4L2_CTRL_WHICH_DEF_VAL   0x0f000000
++#define V4L2_CTRL_WHICH_REQUEST_VAL 0x0f010000
+ 
+ enum v4l2_ctrl_type {
+ 	V4L2_CTRL_TYPE_INTEGER	     = 1,
+-- 
+2.18.0
+
+From c1b319a59db868cf0825c68b239b0947b8e130a8 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:36 +0300
+Subject: [PATCH 10/34] v4l2-ctrls: v4l2_ctrl_add_handler: add from_other_dev
+
+Add a 'bool from_other_dev' argument: set to true if the two
+handlers refer to different devices (e.g. it is true when
+inheriting controls from a subdev into a main v4l2 bridge
+driver).
+
+This will be used later when implementing support for the
+request API since we need to skip such controls.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Alexandre Courbot <acourbot@chromium.org>
+---
+ drivers/media/dvb-frontends/rtl2832_sdr.c     |  5 +-
+ drivers/media/pci/bt8xx/bttv-driver.c         |  2 +-
+ drivers/media/pci/cx23885/cx23885-417.c       |  2 +-
+ drivers/media/pci/cx88/cx88-blackbird.c       |  2 +-
+ drivers/media/pci/cx88/cx88-video.c           |  2 +-
+ drivers/media/pci/saa7134/saa7134-empress.c   |  4 +-
+ drivers/media/pci/saa7134/saa7134-video.c     |  2 +-
+ .../media/platform/exynos4-is/fimc-capture.c  |  2 +-
+ drivers/media/platform/rcar-vin/rcar-core.c   |  2 +-
+ drivers/media/platform/rcar_drif.c            |  2 +-
+ .../media/platform/soc_camera/soc_camera.c    |  3 +-
+ drivers/media/platform/vivid/vivid-ctrls.c    | 46 +++++++++----------
+ drivers/media/usb/cx231xx/cx231xx-417.c       |  2 +-
+ drivers/media/usb/cx231xx/cx231xx-video.c     |  4 +-
+ drivers/media/usb/msi2500/msi2500.c           |  2 +-
+ drivers/media/usb/tm6000/tm6000-video.c       |  2 +-
+ drivers/media/v4l2-core/v4l2-ctrls.c          | 11 +++--
+ drivers/media/v4l2-core/v4l2-device.c         |  3 +-
+ drivers/staging/media/imx/imx-media-dev.c     |  2 +-
+ drivers/staging/media/imx/imx-media-fim.c     |  2 +-
+ include/media/v4l2-ctrls.h                    |  8 +++-
+ 21 files changed, 61 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/media/dvb-frontends/rtl2832_sdr.c b/drivers/media/dvb-frontends/rtl2832_sdr.c
+index c6e78d870ccd..6064d28224e8 100644
+--- a/drivers/media/dvb-frontends/rtl2832_sdr.c
++++ b/drivers/media/dvb-frontends/rtl2832_sdr.c
+@@ -1394,7 +1394,8 @@ static int rtl2832_sdr_probe(struct platform_device *pdev)
+ 	case RTL2832_SDR_TUNER_E4000:
+ 		v4l2_ctrl_handler_init(&dev->hdl, 9);
+ 		if (subdev)
+-			v4l2_ctrl_add_handler(&dev->hdl, subdev->ctrl_handler, NULL);
++			v4l2_ctrl_add_handler(&dev->hdl, subdev->ctrl_handler,
++					      NULL, true);
+ 		break;
+ 	case RTL2832_SDR_TUNER_R820T:
+ 	case RTL2832_SDR_TUNER_R828D:
+@@ -1423,7 +1424,7 @@ static int rtl2832_sdr_probe(struct platform_device *pdev)
+ 		v4l2_ctrl_handler_init(&dev->hdl, 2);
+ 		if (subdev)
+ 			v4l2_ctrl_add_handler(&dev->hdl, subdev->ctrl_handler,
+-					      NULL);
++					      NULL, true);
+ 		break;
+ 	default:
+ 		v4l2_ctrl_handler_init(&dev->hdl, 0);
+diff --git a/drivers/media/pci/bt8xx/bttv-driver.c b/drivers/media/pci/bt8xx/bttv-driver.c
+index cf05e11da01b..e86154092558 100644
+--- a/drivers/media/pci/bt8xx/bttv-driver.c
++++ b/drivers/media/pci/bt8xx/bttv-driver.c
+@@ -4211,7 +4211,7 @@ static int bttv_probe(struct pci_dev *dev, const struct pci_device_id *pci_id)
+ 	/* register video4linux + input */
+ 	if (!bttv_tvcards[btv->c.type].no_video) {
+ 		v4l2_ctrl_add_handler(&btv->radio_ctrl_handler, hdl,
+-				v4l2_ctrl_radio_filter);
++				v4l2_ctrl_radio_filter, false);
+ 		if (btv->radio_ctrl_handler.error) {
+ 			result = btv->radio_ctrl_handler.error;
+ 			goto fail2;
+diff --git a/drivers/media/pci/cx23885/cx23885-417.c b/drivers/media/pci/cx23885/cx23885-417.c
+index a71f3c7569ce..762823871c78 100644
+--- a/drivers/media/pci/cx23885/cx23885-417.c
++++ b/drivers/media/pci/cx23885/cx23885-417.c
+@@ -1527,7 +1527,7 @@ int cx23885_417_register(struct cx23885_dev *dev)
+ 	dev->cxhdl.priv = dev;
+ 	dev->cxhdl.func = cx23885_api_func;
+ 	cx2341x_handler_set_50hz(&dev->cxhdl, tsport->height == 576);
+-	v4l2_ctrl_add_handler(&dev->ctrl_handler, &dev->cxhdl.hdl, NULL);
++	v4l2_ctrl_add_handler(&dev->ctrl_handler, &dev->cxhdl.hdl, NULL, false);
+ 
+ 	/* Allocate and initialize V4L video device */
+ 	dev->v4l_device = cx23885_video_dev_alloc(tsport,
+diff --git a/drivers/media/pci/cx88/cx88-blackbird.c b/drivers/media/pci/cx88/cx88-blackbird.c
+index 7a4876cf9f08..722dd101c9b0 100644
+--- a/drivers/media/pci/cx88/cx88-blackbird.c
++++ b/drivers/media/pci/cx88/cx88-blackbird.c
+@@ -1183,7 +1183,7 @@ static int cx8802_blackbird_probe(struct cx8802_driver *drv)
+ 	err = cx2341x_handler_init(&dev->cxhdl, 36);
+ 	if (err)
+ 		goto fail_core;
+-	v4l2_ctrl_add_handler(&dev->cxhdl.hdl, &core->video_hdl, NULL);
++	v4l2_ctrl_add_handler(&dev->cxhdl.hdl, &core->video_hdl, NULL, false);
+ 
+ 	/* blackbird stuff */
+ 	pr_info("cx23416 based mpeg encoder (blackbird reference design)\n");
+diff --git a/drivers/media/pci/cx88/cx88-video.c b/drivers/media/pci/cx88/cx88-video.c
+index 7b113bad70d2..85e2b6c9fb1c 100644
+--- a/drivers/media/pci/cx88/cx88-video.c
++++ b/drivers/media/pci/cx88/cx88-video.c
+@@ -1378,7 +1378,7 @@ static int cx8800_initdev(struct pci_dev *pci_dev,
+ 		if (vc->id == V4L2_CID_CHROMA_AGC)
+ 			core->chroma_agc = vc;
+ 	}
+-	v4l2_ctrl_add_handler(&core->video_hdl, &core->audio_hdl, NULL);
++	v4l2_ctrl_add_handler(&core->video_hdl, &core->audio_hdl, NULL, false);
+ 
+ 	/* load and configure helper modules */
+ 
+diff --git a/drivers/media/pci/saa7134/saa7134-empress.c b/drivers/media/pci/saa7134/saa7134-empress.c
+index 66acfd35ffc6..fc75ce00dbf8 100644
+--- a/drivers/media/pci/saa7134/saa7134-empress.c
++++ b/drivers/media/pci/saa7134/saa7134-empress.c
+@@ -265,9 +265,9 @@ static int empress_init(struct saa7134_dev *dev)
+ 		 "%s empress (%s)", dev->name,
+ 		 saa7134_boards[dev->board].name);
+ 	v4l2_ctrl_handler_init(hdl, 21);
+-	v4l2_ctrl_add_handler(hdl, &dev->ctrl_handler, empress_ctrl_filter);
++	v4l2_ctrl_add_handler(hdl, &dev->ctrl_handler, empress_ctrl_filter, false);
+ 	if (dev->empress_sd)
+-		v4l2_ctrl_add_handler(hdl, dev->empress_sd->ctrl_handler, NULL);
++		v4l2_ctrl_add_handler(hdl, dev->empress_sd->ctrl_handler, NULL, true);
+ 	if (hdl->error) {
+ 		video_device_release(dev->empress_dev);
+ 		return hdl->error;
+diff --git a/drivers/media/pci/saa7134/saa7134-video.c b/drivers/media/pci/saa7134/saa7134-video.c
+index 1a50ec9d084f..41d46488d22e 100644
+--- a/drivers/media/pci/saa7134/saa7134-video.c
++++ b/drivers/media/pci/saa7134/saa7134-video.c
+@@ -2136,7 +2136,7 @@ int saa7134_video_init1(struct saa7134_dev *dev)
+ 		hdl = &dev->radio_ctrl_handler;
+ 		v4l2_ctrl_handler_init(hdl, 2);
+ 		v4l2_ctrl_add_handler(hdl, &dev->ctrl_handler,
+-				v4l2_ctrl_radio_filter);
++				v4l2_ctrl_radio_filter, false);
+ 		if (hdl->error)
+ 			return hdl->error;
+ 	}
+diff --git a/drivers/media/platform/exynos4-is/fimc-capture.c b/drivers/media/platform/exynos4-is/fimc-capture.c
+index a3cdac188190..2164375f0ee0 100644
+--- a/drivers/media/platform/exynos4-is/fimc-capture.c
++++ b/drivers/media/platform/exynos4-is/fimc-capture.c
+@@ -1424,7 +1424,7 @@ static int fimc_link_setup(struct media_entity *entity,
+ 		return 0;
+ 
+ 	return v4l2_ctrl_add_handler(&vc->ctx->ctrls.handler,
+-				     sensor->ctrl_handler, NULL);
++				     sensor->ctrl_handler, NULL, true);
+ }
+ 
+ static const struct media_entity_operations fimc_sd_media_ops = {
+diff --git a/drivers/media/platform/rcar-vin/rcar-core.c b/drivers/media/platform/rcar-vin/rcar-core.c
+index 8843367cd339..08446d005e08 100644
+--- a/drivers/media/platform/rcar-vin/rcar-core.c
++++ b/drivers/media/platform/rcar-vin/rcar-core.c
+@@ -480,7 +480,7 @@ static int rvin_parallel_subdevice_attach(struct rvin_dev *vin,
+ 		return ret;
+ 
+ 	ret = v4l2_ctrl_add_handler(&vin->ctrl_handler, subdev->ctrl_handler,
+-				    NULL);
++				    NULL, true);
+ 	if (ret < 0) {
+ 		v4l2_ctrl_handler_free(&vin->ctrl_handler);
+ 		return ret;
+diff --git a/drivers/media/platform/rcar_drif.c b/drivers/media/platform/rcar_drif.c
+index dc7e280c91b4..159c7d2c2066 100644
+--- a/drivers/media/platform/rcar_drif.c
++++ b/drivers/media/platform/rcar_drif.c
+@@ -1168,7 +1168,7 @@ static int rcar_drif_notify_complete(struct v4l2_async_notifier *notifier)
+ 	}
+ 
+ 	ret = v4l2_ctrl_add_handler(&sdr->ctrl_hdl,
+-				    sdr->ep.subdev->ctrl_handler, NULL);
++				    sdr->ep.subdev->ctrl_handler, NULL, true);
+ 	if (ret) {
+ 		rdrif_err(sdr, "failed: ctrl add hdlr ret %d\n", ret);
+ 		goto error;
+diff --git a/drivers/media/platform/soc_camera/soc_camera.c b/drivers/media/platform/soc_camera/soc_camera.c
+index 66d613629167..901c07f49351 100644
+--- a/drivers/media/platform/soc_camera/soc_camera.c
++++ b/drivers/media/platform/soc_camera/soc_camera.c
+@@ -1181,7 +1181,8 @@ static int soc_camera_probe_finish(struct soc_camera_device *icd)
+ 
+ 	v4l2_subdev_call(sd, video, g_tvnorms, &icd->vdev->tvnorms);
+ 
+-	ret = v4l2_ctrl_add_handler(&icd->ctrl_handler, sd->ctrl_handler, NULL);
++	ret = v4l2_ctrl_add_handler(&icd->ctrl_handler, sd->ctrl_handler,
++				    NULL, true);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/drivers/media/platform/vivid/vivid-ctrls.c b/drivers/media/platform/vivid/vivid-ctrls.c
+index 5429193fbb91..5655f39d8e76 100644
+--- a/drivers/media/platform/vivid/vivid-ctrls.c
++++ b/drivers/media/platform/vivid/vivid-ctrls.c
+@@ -1662,59 +1662,59 @@ int vivid_create_controls(struct vivid_dev *dev, bool show_ccs_cap,
+ 		v4l2_ctrl_auto_cluster(2, &dev->autogain, 0, true);
+ 
+ 	if (dev->has_vid_cap) {
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_vid, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_aud, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_streaming, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_sdtv_cap, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_loop_cap, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_fb, NULL);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_vid, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_user_aud, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_streaming, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_sdtv_cap, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_loop_cap, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_cap, hdl_fb, NULL, false);
+ 		if (hdl_vid_cap->error)
+ 			return hdl_vid_cap->error;
+ 		dev->vid_cap_dev.ctrl_handler = hdl_vid_cap;
+ 	}
+ 	if (dev->has_vid_out) {
+-		v4l2_ctrl_add_handler(hdl_vid_out, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_out, hdl_user_aud, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_out, hdl_streaming, NULL);
+-		v4l2_ctrl_add_handler(hdl_vid_out, hdl_fb, NULL);
++		v4l2_ctrl_add_handler(hdl_vid_out, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_out, hdl_user_aud, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_out, hdl_streaming, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vid_out, hdl_fb, NULL, false);
+ 		if (hdl_vid_out->error)
+ 			return hdl_vid_out->error;
+ 		dev->vid_out_dev.ctrl_handler = hdl_vid_out;
+ 	}
+ 	if (dev->has_vbi_cap) {
+-		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_streaming, NULL);
+-		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_sdtv_cap, NULL);
+-		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_loop_cap, NULL);
++		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_streaming, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_sdtv_cap, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vbi_cap, hdl_loop_cap, NULL, false);
+ 		if (hdl_vbi_cap->error)
+ 			return hdl_vbi_cap->error;
+ 		dev->vbi_cap_dev.ctrl_handler = hdl_vbi_cap;
+ 	}
+ 	if (dev->has_vbi_out) {
+-		v4l2_ctrl_add_handler(hdl_vbi_out, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_vbi_out, hdl_streaming, NULL);
++		v4l2_ctrl_add_handler(hdl_vbi_out, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_vbi_out, hdl_streaming, NULL, false);
+ 		if (hdl_vbi_out->error)
+ 			return hdl_vbi_out->error;
+ 		dev->vbi_out_dev.ctrl_handler = hdl_vbi_out;
+ 	}
+ 	if (dev->has_radio_rx) {
+-		v4l2_ctrl_add_handler(hdl_radio_rx, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_radio_rx, hdl_user_aud, NULL);
++		v4l2_ctrl_add_handler(hdl_radio_rx, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_radio_rx, hdl_user_aud, NULL, false);
+ 		if (hdl_radio_rx->error)
+ 			return hdl_radio_rx->error;
+ 		dev->radio_rx_dev.ctrl_handler = hdl_radio_rx;
+ 	}
+ 	if (dev->has_radio_tx) {
+-		v4l2_ctrl_add_handler(hdl_radio_tx, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_radio_tx, hdl_user_aud, NULL);
++		v4l2_ctrl_add_handler(hdl_radio_tx, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_radio_tx, hdl_user_aud, NULL, false);
+ 		if (hdl_radio_tx->error)
+ 			return hdl_radio_tx->error;
+ 		dev->radio_tx_dev.ctrl_handler = hdl_radio_tx;
+ 	}
+ 	if (dev->has_sdr_cap) {
+-		v4l2_ctrl_add_handler(hdl_sdr_cap, hdl_user_gen, NULL);
+-		v4l2_ctrl_add_handler(hdl_sdr_cap, hdl_streaming, NULL);
++		v4l2_ctrl_add_handler(hdl_sdr_cap, hdl_user_gen, NULL, false);
++		v4l2_ctrl_add_handler(hdl_sdr_cap, hdl_streaming, NULL, false);
+ 		if (hdl_sdr_cap->error)
+ 			return hdl_sdr_cap->error;
+ 		dev->sdr_cap_dev.ctrl_handler = hdl_sdr_cap;
+diff --git a/drivers/media/usb/cx231xx/cx231xx-417.c b/drivers/media/usb/cx231xx/cx231xx-417.c
+index 2f3b0564d676..e3cb9eefd36a 100644
+--- a/drivers/media/usb/cx231xx/cx231xx-417.c
++++ b/drivers/media/usb/cx231xx/cx231xx-417.c
+@@ -1992,7 +1992,7 @@ int cx231xx_417_register(struct cx231xx *dev)
+ 	dev->mpeg_ctrl_handler.ops = &cx231xx_ops;
+ 	if (dev->sd_cx25840)
+ 		v4l2_ctrl_add_handler(&dev->mpeg_ctrl_handler.hdl,
+-				dev->sd_cx25840->ctrl_handler, NULL);
++				dev->sd_cx25840->ctrl_handler, NULL, false);
+ 	if (dev->mpeg_ctrl_handler.hdl.error) {
+ 		err = dev->mpeg_ctrl_handler.hdl.error;
+ 		dprintk(3, "%s: can't add cx25840 controls\n", dev->name);
+diff --git a/drivers/media/usb/cx231xx/cx231xx-video.c b/drivers/media/usb/cx231xx/cx231xx-video.c
+index f7fcd733a2ca..2dedb18f63a0 100644
+--- a/drivers/media/usb/cx231xx/cx231xx-video.c
++++ b/drivers/media/usb/cx231xx/cx231xx-video.c
+@@ -2204,10 +2204,10 @@ int cx231xx_register_analog_devices(struct cx231xx *dev)
+ 
+ 	if (dev->sd_cx25840) {
+ 		v4l2_ctrl_add_handler(&dev->ctrl_handler,
+-				dev->sd_cx25840->ctrl_handler, NULL);
++				dev->sd_cx25840->ctrl_handler, NULL, true);
+ 		v4l2_ctrl_add_handler(&dev->radio_ctrl_handler,
+ 				dev->sd_cx25840->ctrl_handler,
+-				v4l2_ctrl_radio_filter);
++				v4l2_ctrl_radio_filter, true);
+ 	}
+ 
+ 	if (dev->ctrl_handler.error)
+diff --git a/drivers/media/usb/msi2500/msi2500.c b/drivers/media/usb/msi2500/msi2500.c
+index 65ef755adfdc..4aacd77a5d58 100644
+--- a/drivers/media/usb/msi2500/msi2500.c
++++ b/drivers/media/usb/msi2500/msi2500.c
+@@ -1278,7 +1278,7 @@ static int msi2500_probe(struct usb_interface *intf,
+ 	}
+ 
+ 	/* currently all controls are from subdev */
+-	v4l2_ctrl_add_handler(&dev->hdl, sd->ctrl_handler, NULL);
++	v4l2_ctrl_add_handler(&dev->hdl, sd->ctrl_handler, NULL, true);
+ 
+ 	dev->v4l2_dev.ctrl_handler = &dev->hdl;
+ 	dev->vdev.v4l2_dev = &dev->v4l2_dev;
+diff --git a/drivers/media/usb/tm6000/tm6000-video.c b/drivers/media/usb/tm6000/tm6000-video.c
+index 96055de6e8ce..176abbf5fbba 100644
+--- a/drivers/media/usb/tm6000/tm6000-video.c
++++ b/drivers/media/usb/tm6000/tm6000-video.c
+@@ -1625,7 +1625,7 @@ int tm6000_v4l2_register(struct tm6000_core *dev)
+ 	v4l2_ctrl_new_std(&dev->ctrl_handler, &tm6000_ctrl_ops,
+ 			V4L2_CID_HUE, -128, 127, 1, 0);
+ 	v4l2_ctrl_add_handler(&dev->ctrl_handler,
+-			&dev->radio_ctrl_handler, NULL);
++			&dev->radio_ctrl_handler, NULL, false);
+ 
+ 	if (dev->radio_ctrl_handler.error)
+ 		ret = dev->radio_ctrl_handler.error;
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 599c1cbff3b9..404291f00715 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -2016,7 +2016,8 @@ EXPORT_SYMBOL(v4l2_ctrl_find);
+ 
+ /* Allocate a new v4l2_ctrl_ref and hook it into the handler. */
+ static int handler_new_ref(struct v4l2_ctrl_handler *hdl,
+-			   struct v4l2_ctrl *ctrl)
++			   struct v4l2_ctrl *ctrl,
++			   bool from_other_dev)
+ {
+ 	struct v4l2_ctrl_ref *ref;
+ 	struct v4l2_ctrl_ref *new_ref;
+@@ -2040,6 +2041,7 @@ static int handler_new_ref(struct v4l2_ctrl_handler *hdl,
+ 	if (!new_ref)
+ 		return handler_set_err(hdl, -ENOMEM);
+ 	new_ref->ctrl = ctrl;
++	new_ref->from_other_dev = from_other_dev;
+ 	if (ctrl->handler == hdl) {
+ 		/* By default each control starts in a cluster of its own.
+ 		   new_ref->ctrl is basically a cluster array with one
+@@ -2220,7 +2222,7 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
+ 		ctrl->type_ops->init(ctrl, idx, ctrl->p_new);
+ 	}
+ 
+-	if (handler_new_ref(hdl, ctrl)) {
++	if (handler_new_ref(hdl, ctrl, false)) {
+ 		kvfree(ctrl);
+ 		return NULL;
+ 	}
+@@ -2389,7 +2391,8 @@ EXPORT_SYMBOL(v4l2_ctrl_new_int_menu);
+ /* Add the controls from another handler to our own. */
+ int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *hdl,
+ 			  struct v4l2_ctrl_handler *add,
+-			  bool (*filter)(const struct v4l2_ctrl *ctrl))
++			  bool (*filter)(const struct v4l2_ctrl *ctrl),
++			  bool from_other_dev)
+ {
+ 	struct v4l2_ctrl_ref *ref;
+ 	int ret = 0;
+@@ -2412,7 +2415,7 @@ int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *hdl,
+ 		/* Filter any unwanted controls */
+ 		if (filter && !filter(ctrl))
+ 			continue;
+-		ret = handler_new_ref(hdl, ctrl);
++		ret = handler_new_ref(hdl, ctrl, from_other_dev);
+ 		if (ret)
+ 			break;
+ 	}
+diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l2-device.c
+index 3940e55c72f1..5189fb9f741f 100644
+--- a/drivers/media/v4l2-core/v4l2-device.c
++++ b/drivers/media/v4l2-core/v4l2-device.c
+@@ -178,7 +178,8 @@ int v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
+ 
+ 	sd->v4l2_dev = v4l2_dev;
+ 	/* This just returns 0 if either of the two args is NULL */
+-	err = v4l2_ctrl_add_handler(v4l2_dev->ctrl_handler, sd->ctrl_handler, NULL);
++	err = v4l2_ctrl_add_handler(v4l2_dev->ctrl_handler, sd->ctrl_handler,
++				    NULL, true);
+ 	if (err)
+ 		goto error_module;
+ 
+diff --git a/drivers/staging/media/imx/imx-media-dev.c b/drivers/staging/media/imx/imx-media-dev.c
+index b0be80f05767..b03a4b7bb769 100644
+--- a/drivers/staging/media/imx/imx-media-dev.c
++++ b/drivers/staging/media/imx/imx-media-dev.c
+@@ -391,7 +391,7 @@ static int imx_media_inherit_controls(struct imx_media_dev *imxmd,
+ 
+ 		ret = v4l2_ctrl_add_handler(vfd->ctrl_handler,
+ 					    sd->ctrl_handler,
+-					    NULL);
++					    NULL, true);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/staging/media/imx/imx-media-fim.c b/drivers/staging/media/imx/imx-media-fim.c
+index 6df189135db8..8cf773eef9da 100644
+--- a/drivers/staging/media/imx/imx-media-fim.c
++++ b/drivers/staging/media/imx/imx-media-fim.c
+@@ -463,7 +463,7 @@ int imx_media_fim_add_controls(struct imx_media_fim *fim)
+ {
+ 	/* add the FIM controls to the calling subdev ctrl handler */
+ 	return v4l2_ctrl_add_handler(fim->sd->ctrl_handler,
+-				     &fim->ctrl_handler, NULL);
++				     &fim->ctrl_handler, NULL, false);
+ }
+ EXPORT_SYMBOL_GPL(imx_media_fim_add_controls);
+ 
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index 5b445b5654f7..d26b8ddebb56 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -247,6 +247,8 @@ struct v4l2_ctrl {
+  * @ctrl:	The actual control information.
+  * @helper:	Pointer to helper struct. Used internally in
+  *		``prepare_ext_ctrls`` function at ``v4l2-ctrl.c``.
++ * @from_other_dev: If true, then @ctrl was defined in another
++ *		device than the &struct v4l2_ctrl_handler.
+  *
+  * Each control handler has a list of these refs. The list_head is used to
+  * keep a sorted-by-control-ID list of all controls, while the next pointer
+@@ -257,6 +259,7 @@ struct v4l2_ctrl_ref {
+ 	struct v4l2_ctrl_ref *next;
+ 	struct v4l2_ctrl *ctrl;
+ 	struct v4l2_ctrl_helper *helper;
++	bool from_other_dev;
+ };
+ 
+ /**
+@@ -633,6 +636,8 @@ typedef bool (*v4l2_ctrl_filter)(const struct v4l2_ctrl *ctrl);
+  * @add:	The control handler whose controls you want to add to
+  *		the @hdl control handler.
+  * @filter:	This function will filter which controls should be added.
++ * @from_other_dev: If true, then the controls in @add were defined in another
++ *		device than @hdl.
+  *
+  * Does nothing if either of the two handlers is a NULL pointer.
+  * If @filter is NULL, then all controls are added. Otherwise only those
+@@ -642,7 +647,8 @@ typedef bool (*v4l2_ctrl_filter)(const struct v4l2_ctrl *ctrl);
+  */
+ int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *hdl,
+ 			  struct v4l2_ctrl_handler *add,
+-			  v4l2_ctrl_filter filter);
++			  v4l2_ctrl_filter filter,
++			  bool from_other_dev);
+ 
+ /**
+  * v4l2_ctrl_radio_filter() - Standard filter for radio controls.
+-- 
+2.18.0
+
+From 6c9629aa4f97c67919457222887cbb191e0c9e99 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:37 +0300
+Subject: [PATCH 11/34] v4l2-ctrls: prepare internal structs for request API
+
+Embed and initialize a media_request_object in struct v4l2_ctrl_handler.
+
+Add a p_req field to struct v4l2_ctrl_ref that will store the
+request value.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Alexandre Courbot <acourbot@chromium.org>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c |  1 +
+ include/media/v4l2-ctrls.h           | 10 ++++++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 404291f00715..b33a8bee82b0 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -1901,6 +1901,7 @@ int v4l2_ctrl_handler_init_class(struct v4l2_ctrl_handler *hdl,
+ 				      sizeof(hdl->buckets[0]),
+ 				      GFP_KERNEL | __GFP_ZERO);
+ 	hdl->error = hdl->buckets ? 0 : -ENOMEM;
++	media_request_object_init(&hdl->req_obj);
+ 	return hdl->error;
+ }
+ EXPORT_SYMBOL(v4l2_ctrl_handler_init_class);
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index d26b8ddebb56..847d6f543e4a 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -20,6 +20,7 @@
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/videodev2.h>
++#include <media/media-request.h>
+ 
+ /* forward references */
+ struct file;
+@@ -249,6 +250,11 @@ struct v4l2_ctrl {
+  *		``prepare_ext_ctrls`` function at ``v4l2-ctrl.c``.
+  * @from_other_dev: If true, then @ctrl was defined in another
+  *		device than the &struct v4l2_ctrl_handler.
++ * @p_req:	If the control handler containing this control reference
++ *		is bound to a media request, then this points to the
++ *		value of the control that should be applied when the request
++ *		is executed, or to the value of the control at the time
++ *		that the request was completed.
+  *
+  * Each control handler has a list of these refs. The list_head is used to
+  * keep a sorted-by-control-ID list of all controls, while the next pointer
+@@ -260,6 +266,7 @@ struct v4l2_ctrl_ref {
+ 	struct v4l2_ctrl *ctrl;
+ 	struct v4l2_ctrl_helper *helper;
+ 	bool from_other_dev;
++	union v4l2_ctrl_ptr p_req;
+ };
+ 
+ /**
+@@ -283,6 +290,8 @@ struct v4l2_ctrl_ref {
+  * @notify_priv: Passed as argument to the v4l2_ctrl notify callback.
+  * @nr_of_buckets: Total number of buckets in the array.
+  * @error:	The error code of the first failed control addition.
++ * @req_obj:	The &struct media_request_object, used to link into a
++ *		&struct media_request. This request object has a refcount.
+  */
+ struct v4l2_ctrl_handler {
+ 	struct mutex _lock;
+@@ -295,6 +304,7 @@ struct v4l2_ctrl_handler {
+ 	void *notify_priv;
+ 	u16 nr_of_buckets;
+ 	int error;
++	struct media_request_object req_obj;
+ };
+ 
+ /**
+-- 
+2.18.0
+
+From b4846955ba45544008e218a460e25b17ce6e9236 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:38 +0300
+Subject: [PATCH 12/34] v4l2-ctrls: alloc memory for p_req
+
+To store request data the handler_new_ref() allocates memory
+for it if needed.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index b33a8bee82b0..171ab389afdd 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -2018,13 +2018,18 @@ EXPORT_SYMBOL(v4l2_ctrl_find);
+ /* Allocate a new v4l2_ctrl_ref and hook it into the handler. */
+ static int handler_new_ref(struct v4l2_ctrl_handler *hdl,
+ 			   struct v4l2_ctrl *ctrl,
+-			   bool from_other_dev)
++			   struct v4l2_ctrl_ref **ctrl_ref,
++			   bool from_other_dev, bool allocate_req)
+ {
+ 	struct v4l2_ctrl_ref *ref;
+ 	struct v4l2_ctrl_ref *new_ref;
+ 	u32 id = ctrl->id;
+ 	u32 class_ctrl = V4L2_CTRL_ID2WHICH(id) | 1;
+ 	int bucket = id % hdl->nr_of_buckets;	/* which bucket to use */
++	unsigned int sz_extra = 0;
++
++	if (ctrl_ref)
++		*ctrl_ref = NULL;
+ 
+ 	/*
+ 	 * Automatically add the control class if it is not yet present and
+@@ -2038,11 +2043,16 @@ static int handler_new_ref(struct v4l2_ctrl_handler *hdl,
+ 	if (hdl->error)
+ 		return hdl->error;
+ 
+-	new_ref = kzalloc(sizeof(*new_ref), GFP_KERNEL);
++	if (allocate_req)
++		sz_extra = ctrl->elems * ctrl->elem_size;
++	new_ref = kzalloc(sizeof(*new_ref) + sz_extra, GFP_KERNEL);
+ 	if (!new_ref)
+ 		return handler_set_err(hdl, -ENOMEM);
+ 	new_ref->ctrl = ctrl;
+ 	new_ref->from_other_dev = from_other_dev;
++	if (sz_extra)
++		new_ref->p_req.p = &new_ref[1];
++
+ 	if (ctrl->handler == hdl) {
+ 		/* By default each control starts in a cluster of its own.
+ 		   new_ref->ctrl is basically a cluster array with one
+@@ -2082,6 +2092,8 @@ static int handler_new_ref(struct v4l2_ctrl_handler *hdl,
+ 	/* Insert the control node in the hash */
+ 	new_ref->next = hdl->buckets[bucket];
+ 	hdl->buckets[bucket] = new_ref;
++	if (ctrl_ref)
++		*ctrl_ref = new_ref;
+ 
+ unlock:
+ 	mutex_unlock(hdl->lock);
+@@ -2223,7 +2235,7 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
+ 		ctrl->type_ops->init(ctrl, idx, ctrl->p_new);
+ 	}
+ 
+-	if (handler_new_ref(hdl, ctrl, false)) {
++	if (handler_new_ref(hdl, ctrl, NULL, false, false)) {
+ 		kvfree(ctrl);
+ 		return NULL;
+ 	}
+@@ -2416,7 +2428,7 @@ int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *hdl,
+ 		/* Filter any unwanted controls */
+ 		if (filter && !filter(ctrl))
+ 			continue;
+-		ret = handler_new_ref(hdl, ctrl, from_other_dev);
++		ret = handler_new_ref(hdl, ctrl, NULL, from_other_dev, false);
+ 		if (ret)
+ 			break;
+ 	}
+-- 
+2.18.0
+
+From 99fce80678f55c71ad9f102e15c56b08ba8fee6a Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:39 +0300
+Subject: [PATCH 13/34] v4l2-ctrls: use ref in helper instead of ctrl
+
+The next patch needs the reference to a control instead of the
+control itself, so change struct v4l2_ctrl_helper accordingly.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 171ab389afdd..570b6f8ae46a 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -37,8 +37,8 @@
+ struct v4l2_ctrl_helper {
+ 	/* Pointer to the control reference of the master control */
+ 	struct v4l2_ctrl_ref *mref;
+-	/* The control corresponding to the v4l2_ext_control ID field. */
+-	struct v4l2_ctrl *ctrl;
++	/* The control ref corresponding to the v4l2_ext_control ID field. */
++	struct v4l2_ctrl_ref *ref;
+ 	/* v4l2_ext_control index of the next control belonging to the
+ 	   same cluster, or 0 if there isn't any. */
+ 	u32 next;
+@@ -2908,6 +2908,7 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 		ref = find_ref_lock(hdl, id);
+ 		if (ref == NULL)
+ 			return -EINVAL;
++		h->ref = ref;
+ 		ctrl = ref->ctrl;
+ 		if (ctrl->flags & V4L2_CTRL_FLAG_DISABLED)
+ 			return -EINVAL;
+@@ -2930,7 +2931,6 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 		}
+ 		/* Store the ref to the master control of the cluster */
+ 		h->mref = ref;
+-		h->ctrl = ctrl;
+ 		/* Initially set next to 0, meaning that there is no other
+ 		   control in this helper array belonging to the same
+ 		   cluster */
+@@ -3015,7 +3015,7 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 	cs->error_idx = cs->count;
+ 
+ 	for (i = 0; !ret && i < cs->count; i++)
+-		if (helpers[i].ctrl->flags & V4L2_CTRL_FLAG_WRITE_ONLY)
++		if (helpers[i].ref->ctrl->flags & V4L2_CTRL_FLAG_WRITE_ONLY)
+ 			ret = -EACCES;
+ 
+ 	for (i = 0; !ret && i < cs->count; i++) {
+@@ -3050,7 +3050,7 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 
+ 			do {
+ 				ret = ctrl_to_user(cs->controls + idx,
+-						   helpers[idx].ctrl);
++						   helpers[idx].ref->ctrl);
+ 				idx = helpers[idx].next;
+ 			} while (!ret && idx);
+ 		}
+@@ -3202,7 +3202,7 @@ static int validate_ctrls(struct v4l2_ext_controls *cs,
+ 
+ 	cs->error_idx = cs->count;
+ 	for (i = 0; i < cs->count; i++) {
+-		struct v4l2_ctrl *ctrl = helpers[i].ctrl;
++		struct v4l2_ctrl *ctrl = helpers[i].ref->ctrl;
+ 		union v4l2_ctrl_ptr p_new;
+ 
+ 		cs->error_idx = i;
+@@ -3314,7 +3314,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 			do {
+ 				/* Check if the auto control is part of the
+ 				   list, and remember the new value. */
+-				if (helpers[tmp_idx].ctrl == master)
++				if (helpers[tmp_idx].ref->ctrl == master)
+ 					new_auto_val = cs->controls[tmp_idx].value;
+ 				tmp_idx = helpers[tmp_idx].next;
+ 			} while (tmp_idx);
+@@ -3327,7 +3327,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		/* Copy the new caller-supplied control values.
+ 		   user_to_new() sets 'is_new' to 1. */
+ 		do {
+-			struct v4l2_ctrl *ctrl = helpers[idx].ctrl;
++			struct v4l2_ctrl *ctrl = helpers[idx].ref->ctrl;
+ 
+ 			ret = user_to_new(cs->controls + idx, ctrl);
+ 			if (!ret && ctrl->is_ptr)
+@@ -3343,7 +3343,7 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 			idx = i;
+ 			do {
+ 				ret = new_to_user(cs->controls + idx,
+-						helpers[idx].ctrl);
++						helpers[idx].ref->ctrl);
+ 				idx = helpers[idx].next;
+ 			} while (!ret && idx);
+ 		}
+-- 
+2.18.0
+
+From 378d5a8b51110a6db08d08fa6999d3895b141ef5 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:40 +0300
+Subject: [PATCH 14/34] v4l2-ctrls: add core request support
+
+Integrate the request support. This adds the v4l2_ctrl_request_complete
+and v4l2_ctrl_request_setup functions to complete a request and (as a
+helper function) to apply a request to the hardware.
+
+It takes care of queuing requests and correctly chaining control values
+in the request queue.
+
+Note that when a request is marked completed it will copy control values
+to the internal request state. This can be optimized in the future since
+this is sub-optimal when dealing with large compound and/or array controls.
+
+For the initial 'stateless codec' use-case the current implementation is
+sufficient.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 326 ++++++++++++++++++++++++++-
+ include/media/v4l2-ctrls.h           |  51 +++++
+ 2 files changed, 371 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 570b6f8ae46a..b8ff6d6b14cd 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -1668,6 +1668,13 @@ static int new_to_user(struct v4l2_ext_control *c,
+ 	return ptr_to_user(c, ctrl, ctrl->p_new);
+ }
+ 
++/* Helper function: copy the request value back to the caller */
++static int req_to_user(struct v4l2_ext_control *c,
++		       struct v4l2_ctrl_ref *ref)
++{
++	return ptr_to_user(c, ref->ctrl, ref->p_req);
++}
++
+ /* Helper function: copy the initial control value back to the caller */
+ static int def_to_user(struct v4l2_ext_control *c, struct v4l2_ctrl *ctrl)
+ {
+@@ -1787,6 +1794,26 @@ static void cur_to_new(struct v4l2_ctrl *ctrl)
+ 	ptr_to_ptr(ctrl, ctrl->p_cur, ctrl->p_new);
+ }
+ 
++/* Copy the new value to the request value */
++static void new_to_req(struct v4l2_ctrl_ref *ref)
++{
++	if (!ref)
++		return;
++	ptr_to_ptr(ref->ctrl, ref->ctrl->p_new, ref->p_req);
++	ref->req = ref;
++}
++
++/* Copy the request value to the new value */
++static void req_to_new(struct v4l2_ctrl_ref *ref)
++{
++	if (!ref)
++		return;
++	if (ref->req)
++		ptr_to_ptr(ref->ctrl, ref->req->p_req, ref->ctrl->p_new);
++	else
++		ptr_to_ptr(ref->ctrl, ref->ctrl->p_cur, ref->ctrl->p_new);
++}
++
+ /* Return non-zero if one or more of the controls in the cluster has a new
+    value that differs from the current value. */
+ static int cluster_changed(struct v4l2_ctrl *master)
+@@ -1896,6 +1923,9 @@ int v4l2_ctrl_handler_init_class(struct v4l2_ctrl_handler *hdl,
+ 	lockdep_set_class_and_name(hdl->lock, key, name);
+ 	INIT_LIST_HEAD(&hdl->ctrls);
+ 	INIT_LIST_HEAD(&hdl->ctrl_refs);
++	INIT_LIST_HEAD(&hdl->requests);
++	INIT_LIST_HEAD(&hdl->requests_queued);
++	hdl->request_is_queued = false;
+ 	hdl->nr_of_buckets = 1 + nr_of_controls_hint / 8;
+ 	hdl->buckets = kvmalloc_array(hdl->nr_of_buckets,
+ 				      sizeof(hdl->buckets[0]),
+@@ -1916,6 +1946,14 @@ void v4l2_ctrl_handler_free(struct v4l2_ctrl_handler *hdl)
+ 	if (hdl == NULL || hdl->buckets == NULL)
+ 		return;
+ 
++	if (!hdl->req_obj.req && !list_empty(&hdl->requests)) {
++		struct v4l2_ctrl_handler *req, *next_req;
++
++		list_for_each_entry_safe(req, next_req, &hdl->requests, requests) {
++			media_request_object_unbind(&req->req_obj);
++			media_request_object_put(&req->req_obj);
++		}
++	}
+ 	mutex_lock(hdl->lock);
+ 	/* Free all nodes */
+ 	list_for_each_entry_safe(ref, next_ref, &hdl->ctrl_refs, node) {
+@@ -2837,6 +2875,123 @@ int v4l2_querymenu(struct v4l2_ctrl_handler *hdl, struct v4l2_querymenu *qm)
+ }
+ EXPORT_SYMBOL(v4l2_querymenu);
+ 
++static int v4l2_ctrl_request_clone(struct v4l2_ctrl_handler *hdl,
++				   const struct v4l2_ctrl_handler *from)
++{
++	struct v4l2_ctrl_ref *ref;
++	int err;
++
++	if (WARN_ON(!hdl || hdl == from))
++		return -EINVAL;
++
++	if (hdl->error)
++		return hdl->error;
++
++	WARN_ON(hdl->lock != &hdl->_lock);
++
++	mutex_lock(from->lock);
++	list_for_each_entry(ref, &from->ctrl_refs, node) {
++		struct v4l2_ctrl *ctrl = ref->ctrl;
++		struct v4l2_ctrl_ref *new_ref;
++
++		/* Skip refs inherited from other devices */
++		if (ref->from_other_dev)
++			continue;
++		/* And buttons */
++		if (ctrl->type == V4L2_CTRL_TYPE_BUTTON)
++			continue;
++		err = handler_new_ref(hdl, ctrl, &new_ref, false, true);
++		if (err)
++			break;
++	}
++	mutex_unlock(from->lock);
++	return err;
++}
++
++static void v4l2_ctrl_request_queue(struct media_request_object *obj)
++{
++	struct v4l2_ctrl_handler *hdl =
++		container_of(obj, struct v4l2_ctrl_handler, req_obj);
++	struct v4l2_ctrl_handler *main_hdl = obj->priv;
++	struct v4l2_ctrl_handler *prev_hdl = NULL;
++	struct v4l2_ctrl_ref *ref_ctrl, *ref_ctrl_prev = NULL;
++
++	if (list_empty(&main_hdl->requests_queued))
++		goto queue;
++
++	prev_hdl = list_last_entry(&main_hdl->requests_queued,
++				   struct v4l2_ctrl_handler, requests_queued);
++	/*
++	 * Note: prev_hdl and hdl must contain the same list of control
++	 * references, so if any differences are detected then that is a
++	 * driver bug and the WARN_ON is triggered.
++	 */
++	mutex_lock(prev_hdl->lock);
++	ref_ctrl_prev = list_first_entry(&prev_hdl->ctrl_refs,
++					 struct v4l2_ctrl_ref, node);
++	list_for_each_entry(ref_ctrl, &hdl->ctrl_refs, node) {
++		if (ref_ctrl->req)
++			continue;
++		while (ref_ctrl_prev->ctrl->id < ref_ctrl->ctrl->id) {
++			/* Should never happen, but just in case... */
++			if (list_is_last(&ref_ctrl_prev->node,
++					 &prev_hdl->ctrl_refs))
++				break;
++			ref_ctrl_prev = list_next_entry(ref_ctrl_prev, node);
++		}
++		if (WARN_ON(ref_ctrl_prev->ctrl->id != ref_ctrl->ctrl->id))
++			break;
++		ref_ctrl->req = ref_ctrl_prev->req;
++	}
++	mutex_unlock(prev_hdl->lock);
++queue:
++	list_add_tail(&hdl->requests_queued, &main_hdl->requests_queued);
++	hdl->request_is_queued = true;
++}
++
++static void v4l2_ctrl_request_unbind(struct media_request_object *obj)
++{
++	struct v4l2_ctrl_handler *hdl =
++		container_of(obj, struct v4l2_ctrl_handler, req_obj);
++
++	list_del_init(&hdl->requests);
++	if (hdl->request_is_queued) {
++		list_del_init(&hdl->requests_queued);
++		hdl->request_is_queued = false;
++	}
++}
++
++static void v4l2_ctrl_request_release(struct media_request_object *obj)
++{
++	struct v4l2_ctrl_handler *hdl =
++		container_of(obj, struct v4l2_ctrl_handler, req_obj);
++
++	v4l2_ctrl_handler_free(hdl);
++	kfree(hdl);
++}
++
++static const struct media_request_object_ops req_ops = {
++	.queue = v4l2_ctrl_request_queue,
++	.unbind = v4l2_ctrl_request_unbind,
++	.release = v4l2_ctrl_request_release,
++};
++
++static int v4l2_ctrl_request_bind(struct media_request *req,
++			   struct v4l2_ctrl_handler *hdl,
++			   struct v4l2_ctrl_handler *from)
++{
++	int ret;
++
++	ret = v4l2_ctrl_request_clone(hdl, from);
++
++	if (!ret) {
++		ret = media_request_object_bind(req, &req_ops,
++						from, &hdl->req_obj);
++		if (!ret)
++			list_add_tail(&hdl->requests, &from->requests);
++	}
++	return ret;
++}
+ 
+ /* Some general notes on the atomic requirements of VIDIOC_G/TRY/S_EXT_CTRLS:
+ 
+@@ -2898,6 +3053,7 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+ 
+ 		if (cs->which &&
+ 		    cs->which != V4L2_CTRL_WHICH_DEF_VAL &&
++		    cs->which != V4L2_CTRL_WHICH_REQUEST_VAL &&
+ 		    V4L2_CTRL_ID2WHICH(id) != cs->which)
+ 			return -EINVAL;
+ 
+@@ -2977,13 +3133,12 @@ static int prepare_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+    whether there are any controls at all. */
+ static int class_check(struct v4l2_ctrl_handler *hdl, u32 which)
+ {
+-	if (which == 0 || which == V4L2_CTRL_WHICH_DEF_VAL)
++	if (which == 0 || which == V4L2_CTRL_WHICH_DEF_VAL ||
++	    which == V4L2_CTRL_WHICH_REQUEST_VAL)
+ 		return 0;
+ 	return find_ref_lock(hdl, which | 1) ? 0 : -EINVAL;
+ }
+ 
+-
+-
+ /* Get extended controls. Allocates the helpers array if needed. */
+ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs)
+ {
+@@ -3049,8 +3204,12 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 			u32 idx = i;
+ 
+ 			do {
+-				ret = ctrl_to_user(cs->controls + idx,
+-						   helpers[idx].ref->ctrl);
++				if (helpers[idx].ref->req)
++					ret = req_to_user(cs->controls + idx,
++						helpers[idx].ref->req);
++				else
++					ret = ctrl_to_user(cs->controls + idx,
++						helpers[idx].ref->ctrl);
+ 				idx = helpers[idx].next;
+ 			} while (!ret && idx);
+ 		}
+@@ -3336,7 +3495,16 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 		} while (!ret && idx);
+ 
+ 		if (!ret)
+-			ret = try_or_set_cluster(fh, master, set, 0);
++			ret = try_or_set_cluster(fh, master,
++						 !hdl->req_obj.req && set, 0);
++		if (!ret && hdl->req_obj.req && set) {
++			for (j = 0; j < master->ncontrols; j++) {
++				struct v4l2_ctrl_ref *ref =
++					find_ref(hdl, master->cluster[j]->id);
++
++				new_to_req(ref);
++			}
++		}
+ 
+ 		/* Copy the new values back to userspace. */
+ 		if (!ret) {
+@@ -3463,6 +3631,152 @@ int __v4l2_ctrl_s_ctrl_string(struct v4l2_ctrl *ctrl, const char *s)
+ }
+ EXPORT_SYMBOL(__v4l2_ctrl_s_ctrl_string);
+ 
++void v4l2_ctrl_request_complete(struct media_request *req,
++				struct v4l2_ctrl_handler *main_hdl)
++{
++	struct media_request_object *obj;
++	struct v4l2_ctrl_handler *hdl;
++	struct v4l2_ctrl_ref *ref;
++
++	if (!req || !main_hdl)
++		return;
++
++	obj = media_request_object_find(req, &req_ops, main_hdl);
++	if (!obj)
++		return;
++	hdl = container_of(obj, struct v4l2_ctrl_handler, req_obj);
++
++	list_for_each_entry(ref, &hdl->ctrl_refs, node) {
++		struct v4l2_ctrl *ctrl = ref->ctrl;
++		struct v4l2_ctrl *master = ctrl->cluster[0];
++		unsigned int i;
++
++		if (ctrl->flags & V4L2_CTRL_FLAG_VOLATILE) {
++			ref->req = ref;
++
++			v4l2_ctrl_lock(master);
++			/* g_volatile_ctrl will update the current control values */
++			for (i = 0; i < master->ncontrols; i++)
++				cur_to_new(master->cluster[i]);
++			call_op(master, g_volatile_ctrl);
++			new_to_req(ref);
++			v4l2_ctrl_unlock(master);
++			continue;
++		}
++		if (ref->req == ref)
++			continue;
++
++		v4l2_ctrl_lock(ctrl);
++		if (ref->req)
++			ptr_to_ptr(ctrl, ref->req->p_req, ref->p_req);
++		else
++			ptr_to_ptr(ctrl, ctrl->p_cur, ref->p_req);
++		v4l2_ctrl_unlock(ctrl);
++	}
++
++	WARN_ON(!hdl->request_is_queued);
++	list_del_init(&hdl->requests_queued);
++	hdl->request_is_queued = false;
++	media_request_object_complete(obj);
++	media_request_object_put(obj);
++}
++EXPORT_SYMBOL(v4l2_ctrl_request_complete);
++
++void v4l2_ctrl_request_setup(struct media_request *req,
++			     struct v4l2_ctrl_handler *main_hdl)
++{
++	struct media_request_object *obj;
++	struct v4l2_ctrl_handler *hdl;
++	struct v4l2_ctrl_ref *ref;
++
++	if (!req || !main_hdl)
++		return;
++
++	if (WARN_ON(req->state != MEDIA_REQUEST_STATE_QUEUED))
++		return;
++
++	obj = media_request_object_find(req, &req_ops, main_hdl);
++	if (!obj)
++		return;
++	if (obj->completed) {
++		media_request_object_put(obj);
++		return;
++	}
++	hdl = container_of(obj, struct v4l2_ctrl_handler, req_obj);
++
++	list_for_each_entry(ref, &hdl->ctrl_refs, node)
++		ref->req_done = false;
++
++	list_for_each_entry(ref, &hdl->ctrl_refs, node) {
++		struct v4l2_ctrl *ctrl = ref->ctrl;
++		struct v4l2_ctrl *master = ctrl->cluster[0];
++		bool have_new_data = false;
++		int i;
++
++		/*
++		 * Skip if this control was already handled by a cluster.
++		 * Skip button controls and read-only controls.
++		 */
++		if (ref->req_done || ctrl->type == V4L2_CTRL_TYPE_BUTTON ||
++		    (ctrl->flags & V4L2_CTRL_FLAG_READ_ONLY))
++			continue;
++
++		v4l2_ctrl_lock(master);
++		for (i = 0; i < master->ncontrols; i++) {
++			if (master->cluster[i]) {
++				struct v4l2_ctrl_ref *r =
++					find_ref(hdl, master->cluster[i]->id);
++
++				if (r->req && r == r->req) {
++					have_new_data = true;
++					break;
++				}
++			}
++		}
++		if (!have_new_data) {
++			v4l2_ctrl_unlock(master);
++			continue;
++		}
++
++		for (i = 0; i < master->ncontrols; i++) {
++			if (master->cluster[i]) {
++				struct v4l2_ctrl_ref *r =
++					find_ref(hdl, master->cluster[i]->id);
++
++				req_to_new(r);
++				master->cluster[i]->is_new = 1;
++				r->req_done = true;
++			}
++		}
++		/*
++		 * For volatile autoclusters that are currently in auto mode
++		 * we need to discover if it will be set to manual mode.
++		 * If so, then we have to copy the current volatile values
++		 * first since those will become the new manual values (which
++		 * may be overwritten by explicit new values from this set
++		 * of controls).
++		 */
++		if (master->is_auto && master->has_volatiles &&
++		    !is_cur_manual(master)) {
++			s32 new_auto_val = *master->p_new.p_s32;
++
++			/*
++			 * If the new value == the manual value, then copy
++			 * the current volatile values.
++			 */
++			if (new_auto_val == master->manual_mode_value)
++				update_from_auto_cluster(master);
++		}
++
++		try_or_set_cluster(NULL, master, true, 0);
++
++		v4l2_ctrl_unlock(master);
++	}
++
++	media_request_object_put(obj);
++}
++EXPORT_SYMBOL(v4l2_ctrl_request_setup);
++
+ void v4l2_ctrl_notify(struct v4l2_ctrl *ctrl, v4l2_ctrl_notify_fnc notify, void *priv)
+ {
+ 	if (ctrl == NULL)
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index 847d6f543e4a..65eade646156 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -250,6 +250,12 @@ struct v4l2_ctrl {
+  *		``prepare_ext_ctrls`` function at ``v4l2-ctrl.c``.
+  * @from_other_dev: If true, then @ctrl was defined in another
+  *		device than the &struct v4l2_ctrl_handler.
++ * @req_done:	Internal flag: if the control handler containing this control
++ *		reference is bound to a media request, then this is set when
++ *		the control has been applied. This prevents applying controls
++ *		from a cluster with multiple controls twice (when the first
++ *		control of a cluster is applied, they all are).
++ * @req:	If set, this refers to another request that sets this control.
+  * @p_req:	If the control handler containing this control reference
+  *		is bound to a media request, then this points to the
+  *		value of the control that should be applied when the request
+@@ -266,6 +272,8 @@ struct v4l2_ctrl_ref {
+ 	struct v4l2_ctrl *ctrl;
+ 	struct v4l2_ctrl_helper *helper;
+ 	bool from_other_dev;
++	bool req_done;
++	struct v4l2_ctrl_ref *req;
+ 	union v4l2_ctrl_ptr p_req;
+ };
+ 
+@@ -290,6 +298,15 @@ struct v4l2_ctrl_ref {
+  * @notify_priv: Passed as argument to the v4l2_ctrl notify callback.
+  * @nr_of_buckets: Total number of buckets in the array.
+  * @error:	The error code of the first failed control addition.
++ * @request_is_queued: True if the request was queued.
++ * @requests:	List to keep track of open control handler request objects.
++ *		For the parent control handler (@req_obj.req == NULL) this
++ *		is the list header. When the parent control handler is
++ *		removed, it has to unbind and put all these requests since
++ *		they refer to the parent.
++ * @requests_queued: List of the queued requests. This determines the order
++ *		in which these controls are applied. Once the request is
++ *		completed it is removed from this list.
+  * @req_obj:	The &struct media_request_object, used to link into a
+  *		&struct media_request. This request object has a refcount.
+  */
+@@ -304,6 +321,9 @@ struct v4l2_ctrl_handler {
+ 	void *notify_priv;
+ 	u16 nr_of_buckets;
+ 	int error;
++	bool request_is_queued;
++	struct list_head requests;
++	struct list_head requests_queued;
+ 	struct media_request_object req_obj;
+ };
+ 
+@@ -1062,6 +1082,37 @@ int v4l2_ctrl_subscribe_event(struct v4l2_fh *fh,
+  */
+ __poll_t v4l2_ctrl_poll(struct file *file, struct poll_table_struct *wait);
+ 
++/**
++ * v4l2_ctrl_request_setup - helper function to apply control values in a request
++ *
++ * @req: The request
++ * @hdl: The control handler
++ *
++ * This is a helper function to call the control handler's s_ctrl callback with
++ * the control values contained in the request. Do note that this approach of
++ * applying control values in a request is only applicable to memory-to-memory
++ * devices.
++ */
++void v4l2_ctrl_request_setup(struct media_request *req,
++			     struct v4l2_ctrl_handler *hdl);
++
++/**
++ * v4l2_ctrl_request_complete - Complete a control handler request object
++ *
++ * @req: The request
++ * @hdl: The control handler
++ *
++ * This function is to be called on each control handler that may have had a
++ * request object associated with it, i.e. control handlers of a driver that
++ * supports requests.
++ *
++ * The function first obtains the values of any volatile controls in the control
++ * handler and attach them to the request. Then, the function completes the
++ * request object.
++ */
++void v4l2_ctrl_request_complete(struct media_request *req,
++				struct v4l2_ctrl_handler *hdl);
++
+ /* Helpers for ioctl_ops */
+ 
+ /**
+-- 
+2.18.0
+
+From cfe98fa68bf7db7002e52908e480292d33714485 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:42 +0300
+Subject: [PATCH 15/34] v4l2-ctrls: support g/s_ext_ctrls for requests
+
+The v4l2_g/s_ext_ctrls functions now support control handlers that
+represent requests.
+
+The v4l2_ctrls_find_req_obj() function is responsible for finding the
+request from the fd.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/platform/omap3isp/ispvideo.c |   2 +-
+ drivers/media/v4l2-core/v4l2-ctrls.c       | 138 +++++++++++++++++++--
+ drivers/media/v4l2-core/v4l2-ioctl.c       |  12 +-
+ drivers/media/v4l2-core/v4l2-subdev.c      |   9 +-
+ include/media/v4l2-ctrls.h                 |   7 +-
+ 5 files changed, 149 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/media/platform/omap3isp/ispvideo.c b/drivers/media/platform/omap3isp/ispvideo.c
+index 9d228eac24ea..674e7fd3ad99 100644
+--- a/drivers/media/platform/omap3isp/ispvideo.c
++++ b/drivers/media/platform/omap3isp/ispvideo.c
+@@ -1028,7 +1028,7 @@ static int isp_video_check_external_subdevs(struct isp_video *video,
+ 	ctrls.count = 1;
+ 	ctrls.controls = &ctrl;
+ 
+-	ret = v4l2_g_ext_ctrls(pipe->external->ctrl_handler, &ctrls);
++	ret = v4l2_g_ext_ctrls(pipe->external->ctrl_handler, NULL, &ctrls);
+ 	if (ret < 0) {
+ 		dev_warn(isp->dev, "no pixel rate control in subdev %s\n",
+ 			 pipe->external->name);
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index b8ff6d6b14cd..86a6ae54ccaa 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -3140,7 +3140,8 @@ static int class_check(struct v4l2_ctrl_handler *hdl, u32 which)
+ }
+ 
+ /* Get extended controls. Allocates the helpers array if needed. */
+-int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs)
++int __v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl,
++		       struct v4l2_ext_controls *cs)
+ {
+ 	struct v4l2_ctrl_helper helper[4];
+ 	struct v4l2_ctrl_helper *helpers = helper;
+@@ -3220,6 +3221,83 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs
+ 		kvfree(helpers);
+ 	return ret;
+ }
++
++static struct media_request_object *
++v4l2_ctrls_find_req_obj(struct v4l2_ctrl_handler *hdl,
++			struct media_request *req, bool set)
++{
++	struct media_request_object *obj;
++	struct v4l2_ctrl_handler *new_hdl;
++	int ret;
++
++	if (IS_ERR(req))
++		return ERR_CAST(req);
++
++	if (set && WARN_ON(req->state != MEDIA_REQUEST_STATE_UPDATING))
++		return ERR_PTR(-EBUSY);
++
++	obj = media_request_object_find(req, &req_ops, hdl);
++	if (obj)
++		return obj;
++	if (!set)
++		return ERR_PTR(-ENOENT);
++
++	new_hdl = kzalloc(sizeof(*new_hdl), GFP_KERNEL);
++	if (!new_hdl)
++		return ERR_PTR(-ENOMEM);
++
++	obj = &new_hdl->req_obj;
++	ret = v4l2_ctrl_handler_init(new_hdl, (hdl->nr_of_buckets - 1) * 8);
++	if (!ret)
++		ret = v4l2_ctrl_request_bind(req, new_hdl, hdl);
++	if (ret) {
++		kfree(new_hdl);
++
++		return ERR_PTR(ret);
++	}
++
++	media_request_object_get(obj);
++	return obj;
++}
++
++int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct media_device *mdev,
++		     struct v4l2_ext_controls *cs)
++{
++	struct media_request_object *obj = NULL;
++	int ret;
++
++	if (cs->which == V4L2_CTRL_WHICH_REQUEST_VAL) {
++		struct media_request *req;
++
++		if (!mdev || cs->request_fd < 0)
++			return -EINVAL;
++
++		req = media_request_get_by_fd(mdev, cs->request_fd);
++		if (IS_ERR(req))
++			return PTR_ERR(req);
++
++		if (req->state != MEDIA_REQUEST_STATE_IDLE &&
++		    req->state != MEDIA_REQUEST_STATE_COMPLETE) {
++			media_request_put(req);
++			return -EBUSY;
++		}
++
++		obj = v4l2_ctrls_find_req_obj(hdl, req, false);
++		/* Reference to the request held through obj */
++		media_request_put(req);
++		if (IS_ERR(obj))
++			return PTR_ERR(obj);
++
++		hdl = container_of(obj, struct v4l2_ctrl_handler,
++				   req_obj);
++	}
++
++	ret = __v4l2_g_ext_ctrls(hdl, cs);
++
++	if (obj)
++		media_request_object_put(obj);
++	return ret;
++}
+ EXPORT_SYMBOL(v4l2_g_ext_ctrls);
+ 
+ /* Helper function to get a single control */
+@@ -3408,9 +3486,9 @@ static void update_from_auto_cluster(struct v4l2_ctrl *master)
+ }
+ 
+ /* Try or try-and-set controls */
+-static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+-			     struct v4l2_ext_controls *cs,
+-			     bool set)
++static int __try_set_ext_ctrls(struct v4l2_fh *fh,
++			       struct v4l2_ctrl_handler *hdl,
++			       struct v4l2_ext_controls *cs, bool set)
+ {
+ 	struct v4l2_ctrl_helper helper[4];
+ 	struct v4l2_ctrl_helper *helpers = helper;
+@@ -3523,16 +3601,60 @@ static int try_set_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+ 	return ret;
+ }
+ 
+-int v4l2_try_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct v4l2_ext_controls *cs)
++static int try_set_ext_ctrls(struct v4l2_fh *fh,
++			     struct v4l2_ctrl_handler *hdl, struct media_device *mdev,
++			     struct v4l2_ext_controls *cs, bool set)
++{
++	struct media_request_object *obj = NULL;
++	struct media_request *req = NULL;
++	int ret;
++
++	if (cs->which == V4L2_CTRL_WHICH_REQUEST_VAL) {
++		if (!mdev || cs->request_fd < 0)
++			return -EINVAL;
++
++		req = media_request_get_by_fd(mdev, cs->request_fd);
++		if (IS_ERR(req))
++			return PTR_ERR(req);
++
++		ret = media_request_lock_for_update(req);
++		if (ret) {
++			media_request_put(req);
++			return ret;
++		}
++
++		obj = v4l2_ctrls_find_req_obj(hdl, req, set);
++		/* Reference to the request held through obj */
++		media_request_put(req);
++		if (IS_ERR(obj)) {
++			media_request_unlock_for_update(req);
++			return PTR_ERR(obj);
++		}
++		hdl = container_of(obj, struct v4l2_ctrl_handler,
++				   req_obj);
++	}
++
++	ret = __try_set_ext_ctrls(fh, hdl, cs, set);
++
++	if (obj) {
++		media_request_unlock_for_update(obj->req);
++		media_request_object_put(obj);
++	}
++
++	return ret;
++}
++
++int v4l2_try_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct media_device *mdev,
++		       struct v4l2_ext_controls *cs)
+ {
+-	return try_set_ext_ctrls(NULL, hdl, cs, false);
++	return try_set_ext_ctrls(NULL, hdl, mdev, cs, false);
+ }
+ EXPORT_SYMBOL(v4l2_try_ext_ctrls);
+ 
+ int v4l2_s_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+-					struct v4l2_ext_controls *cs)
++		     struct media_device *mdev, struct v4l2_ext_controls *cs)
+ {
+-	return try_set_ext_ctrls(fh, hdl, cs, true);
++	return try_set_ext_ctrls(fh, hdl, mdev, cs, true);
+ }
+ EXPORT_SYMBOL(v4l2_s_ext_ctrls);
+ 
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index cb3a7cf5d9d5..cc657e5261b7 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -2103,9 +2103,9 @@ static int v4l_g_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_g_ext_ctrls(vfh->ctrl_handler, p);
++		return v4l2_g_ext_ctrls(vfh->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_g_ext_ctrls(vfd->ctrl_handler, p);
++		return v4l2_g_ext_ctrls(vfd->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (ops->vidioc_g_ext_ctrls == NULL)
+ 		return -ENOTTY;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_g_ext_ctrls(file, fh, p) :
+@@ -2122,9 +2122,9 @@ static int v4l_s_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, p);
++		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_s_ext_ctrls(NULL, vfd->ctrl_handler, p);
++		return v4l2_s_ext_ctrls(NULL, vfd->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (ops->vidioc_s_ext_ctrls == NULL)
+ 		return -ENOTTY;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_s_ext_ctrls(file, fh, p) :
+@@ -2141,9 +2141,9 @@ static int v4l_try_ext_ctrls(const struct v4l2_ioctl_ops *ops,
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+-		return v4l2_try_ext_ctrls(vfh->ctrl_handler, p);
++		return v4l2_try_ext_ctrls(vfh->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (vfd->ctrl_handler)
+-		return v4l2_try_ext_ctrls(vfd->ctrl_handler, p);
++		return v4l2_try_ext_ctrls(vfd->ctrl_handler, vfd->v4l2_dev->mdev, p);
+ 	if (ops->vidioc_try_ext_ctrls == NULL)
+ 		return -ENOTTY;
+ 	return check_ext_ctrls(p, 0) ? ops->vidioc_try_ext_ctrls(file, fh, p) :
+diff --git a/drivers/media/v4l2-core/v4l2-subdev.c b/drivers/media/v4l2-core/v4l2-subdev.c
+index 6a7f7f75dfd7..b9cff2389eae 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev.c
++++ b/drivers/media/v4l2-core/v4l2-subdev.c
+@@ -222,17 +222,20 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg)
+ 	case VIDIOC_G_EXT_CTRLS:
+ 		if (!vfh->ctrl_handler)
+ 			return -ENOTTY;
+-		return v4l2_g_ext_ctrls(vfh->ctrl_handler, arg);
++		return v4l2_g_ext_ctrls(vfh->ctrl_handler,
++					sd->v4l2_dev->mdev, arg);
+ 
+ 	case VIDIOC_S_EXT_CTRLS:
+ 		if (!vfh->ctrl_handler)
+ 			return -ENOTTY;
+-		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler, arg);
++		return v4l2_s_ext_ctrls(vfh, vfh->ctrl_handler,
++					sd->v4l2_dev->mdev, arg);
+ 
+ 	case VIDIOC_TRY_EXT_CTRLS:
+ 		if (!vfh->ctrl_handler)
+ 			return -ENOTTY;
+-		return v4l2_try_ext_ctrls(vfh->ctrl_handler, arg);
++		return v4l2_try_ext_ctrls(vfh->ctrl_handler,
++					  sd->v4l2_dev->mdev, arg);
+ 
+ 	case VIDIOC_DQEVENT:
+ 		if (!(sd->flags & V4L2_SUBDEV_FL_HAS_EVENTS))
+diff --git a/include/media/v4l2-ctrls.h b/include/media/v4l2-ctrls.h
+index 65eade646156..de70cc3a1b80 100644
+--- a/include/media/v4l2-ctrls.h
++++ b/include/media/v4l2-ctrls.h
+@@ -1179,11 +1179,12 @@ int v4l2_s_ctrl(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
+  *	:ref:`VIDIOC_G_EXT_CTRLS <vidioc_g_ext_ctrls>` ioctl
+  *
+  * @hdl: pointer to &struct v4l2_ctrl_handler
++ * @mdev: pointer to &struct media_device
+  * @c: pointer to &struct v4l2_ext_controls
+  *
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+-int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl,
++int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl, struct media_device *mdev,
+ 		     struct v4l2_ext_controls *c);
+ 
+ /**
+@@ -1191,11 +1192,13 @@ int v4l2_g_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+  *	:ref:`VIDIOC_TRY_EXT_CTRLS <vidioc_g_ext_ctrls>` ioctl
+  *
+  * @hdl: pointer to &struct v4l2_ctrl_handler
++ * @mdev: pointer to &struct media_device
+  * @c: pointer to &struct v4l2_ext_controls
+  *
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+ int v4l2_try_ext_ctrls(struct v4l2_ctrl_handler *hdl,
++		       struct media_device *mdev,
+ 		       struct v4l2_ext_controls *c);
+ 
+ /**
+@@ -1204,11 +1207,13 @@ int v4l2_try_ext_ctrls(struct v4l2_ctrl_handler *hdl,
+  *
+  * @fh: pointer to &struct v4l2_fh
+  * @hdl: pointer to &struct v4l2_ctrl_handler
++ * @mdev: pointer to &struct media_device
+  * @c: pointer to &struct v4l2_ext_controls
+  *
+  * If hdl == NULL then they will all return -EINVAL.
+  */
+ int v4l2_s_ext_ctrls(struct v4l2_fh *fh, struct v4l2_ctrl_handler *hdl,
++		     struct media_device *mdev,
+ 		     struct v4l2_ext_controls *c);
+ 
+ /**
+-- 
+2.18.0
+
+From 93667b9ad9809f9c50e6eacf484ad5869bf5f441 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:45 +0300
+Subject: [PATCH 16/34] vb2: store userspace data in vb2_v4l2_buffer
+
+The userspace-provided plane data needs to be stored in
+vb2_v4l2_buffer. Currently this information is applied by
+__fill_vb2_buffer() which is called by the core prepare_buf
+and qbuf functions, but when using requests these functions
+aren't called yet since the buffer won't be prepared until
+the media request is actually queued.
+
+In the meantime this information has to be stored somewhere
+and vb2_v4l2_buffer is a good place for it.
+
+The __fill_vb2_buffer callback now just copies the relevant
+information from vb2_v4l2_buffer into the planes array.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-core.c   |  43 +--
+ .../media/common/videobuf2/videobuf2-v4l2.c   | 327 ++++++++++--------
+ drivers/media/dvb-core/dvb_vb2.c              |   3 +-
+ include/media/videobuf2-core.h                |   3 +-
+ include/media/videobuf2-v4l2.h                |   2 +
+ 5 files changed, 209 insertions(+), 169 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index f32ec7342ef0..c25bad134ba3 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -967,20 +967,19 @@ EXPORT_SYMBOL_GPL(vb2_discard_done);
+ /*
+  * __prepare_mmap() - prepare an MMAP buffer
+  */
+-static int __prepare_mmap(struct vb2_buffer *vb, const void *pb)
++static int __prepare_mmap(struct vb2_buffer *vb)
+ {
+ 	int ret = 0;
+ 
+-	if (pb)
+-		ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
+-				 vb, pb, vb->planes);
++	ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
++			 vb, vb->planes);
+ 	return ret ? ret : call_vb_qop(vb, buf_prepare, vb);
+ }
+ 
+ /*
+  * __prepare_userptr() - prepare a USERPTR buffer
+  */
+-static int __prepare_userptr(struct vb2_buffer *vb, const void *pb)
++static int __prepare_userptr(struct vb2_buffer *vb)
+ {
+ 	struct vb2_plane planes[VB2_MAX_PLANES];
+ 	struct vb2_queue *q = vb->vb2_queue;
+@@ -991,12 +990,10 @@ static int __prepare_userptr(struct vb2_buffer *vb, const void *pb)
+ 
+ 	memset(planes, 0, sizeof(planes[0]) * vb->num_planes);
+ 	/* Copy relevant information provided by the userspace */
+-	if (pb) {
+-		ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
+-				 vb, pb, planes);
+-		if (ret)
+-			return ret;
+-	}
++	ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
++			 vb, planes);
++	if (ret)
++		return ret;
+ 
+ 	for (plane = 0; plane < vb->num_planes; ++plane) {
+ 		/* Skip the plane if already verified */
+@@ -1096,7 +1093,7 @@ static int __prepare_userptr(struct vb2_buffer *vb, const void *pb)
+ /*
+  * __prepare_dmabuf() - prepare a DMABUF buffer
+  */
+-static int __prepare_dmabuf(struct vb2_buffer *vb, const void *pb)
++static int __prepare_dmabuf(struct vb2_buffer *vb)
+ {
+ 	struct vb2_plane planes[VB2_MAX_PLANES];
+ 	struct vb2_queue *q = vb->vb2_queue;
+@@ -1107,12 +1104,10 @@ static int __prepare_dmabuf(struct vb2_buffer *vb, const void *pb)
+ 
+ 	memset(planes, 0, sizeof(planes[0]) * vb->num_planes);
+ 	/* Copy relevant information provided by the userspace */
+-	if (pb) {
+-		ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
+-				 vb, pb, planes);
+-		if (ret)
+-			return ret;
+-	}
++	ret = call_bufop(vb->vb2_queue, fill_vb2_buffer,
++			 vb, planes);
++	if (ret)
++		return ret;
+ 
+ 	for (plane = 0; plane < vb->num_planes; ++plane) {
+ 		struct dma_buf *dbuf = dma_buf_get(planes[plane].m.fd);
+@@ -1241,7 +1236,7 @@ static void __enqueue_in_driver(struct vb2_buffer *vb)
+ 	call_void_vb_qop(vb, buf_queue, vb);
+ }
+ 
+-static int __buf_prepare(struct vb2_buffer *vb, const void *pb)
++static int __buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct vb2_queue *q = vb->vb2_queue;
+ 	unsigned int plane;
+@@ -1256,13 +1251,13 @@ static int __buf_prepare(struct vb2_buffer *vb, const void *pb)
+ 
+ 	switch (q->memory) {
+ 	case VB2_MEMORY_MMAP:
+-		ret = __prepare_mmap(vb, pb);
++		ret = __prepare_mmap(vb);
+ 		break;
+ 	case VB2_MEMORY_USERPTR:
+-		ret = __prepare_userptr(vb, pb);
++		ret = __prepare_userptr(vb);
+ 		break;
+ 	case VB2_MEMORY_DMABUF:
+-		ret = __prepare_dmabuf(vb, pb);
++		ret = __prepare_dmabuf(vb);
+ 		break;
+ 	default:
+ 		WARN(1, "Invalid queue type\n");
+@@ -1296,7 +1291,7 @@ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb)
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = __buf_prepare(vb, pb);
++	ret = __buf_prepare(vb);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1381,7 +1376,7 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb)
+ 
+ 	switch (vb->state) {
+ 	case VB2_BUF_STATE_DEQUEUED:
+-		ret = __buf_prepare(vb, pb);
++		ret = __buf_prepare(vb);
+ 		if (ret)
+ 			return ret;
+ 		break;
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index 886a2d8d5c6c..360dc4e7d413 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -154,9 +154,177 @@ static void vb2_warn_zero_bytesused(struct vb2_buffer *vb)
+ 		pr_warn("use the actual size instead.\n");
+ }
+ 
++static int vb2_fill_vb2_v4l2_buffer(struct vb2_buffer *vb, struct v4l2_buffer *b)
++{
++	struct vb2_queue *q = vb->vb2_queue;
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct vb2_plane *planes = vbuf->planes;
++	unsigned int plane;
++	int ret;
++
++	ret = __verify_length(vb, b);
++	if (ret < 0) {
++		dprintk(1, "plane parameters verification failed: %d\n", ret);
++		return ret;
++	}
++	if (b->field == V4L2_FIELD_ALTERNATE && q->is_output) {
++		/*
++		 * If the format's field is ALTERNATE, then the buffer's field
++		 * should be either TOP or BOTTOM, not ALTERNATE since that
++		 * makes no sense. The driver has to know whether the
++		 * buffer represents a top or a bottom field in order to
++		 * program any DMA correctly. Using ALTERNATE is wrong, since
++		 * that just says that it is either a top or a bottom field,
++		 * but not which of the two it is.
++		 */
++		dprintk(1, "the field is incorrectly set to ALTERNATE for an output buffer\n");
++		return -EINVAL;
++	}
++	vbuf->sequence = 0;
++
++	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++		switch (b->memory) {
++		case VB2_MEMORY_USERPTR:
++			for (plane = 0; plane < vb->num_planes; ++plane) {
++				planes[plane].m.userptr =
++					b->m.planes[plane].m.userptr;
++				planes[plane].length =
++					b->m.planes[plane].length;
++			}
++			break;
++		case VB2_MEMORY_DMABUF:
++			for (plane = 0; plane < vb->num_planes; ++plane) {
++				planes[plane].m.fd =
++					b->m.planes[plane].m.fd;
++				planes[plane].length =
++					b->m.planes[plane].length;
++			}
++			break;
++		default:
++			for (plane = 0; plane < vb->num_planes; ++plane) {
++				planes[plane].m.offset =
++					vb->planes[plane].m.offset;
++				planes[plane].length =
++					vb->planes[plane].length;
++			}
++			break;
++		}
++
++		/* Fill in driver-provided information for OUTPUT types */
++		if (V4L2_TYPE_IS_OUTPUT(b->type)) {
++			/*
++			 * Will have to go up to b->length when API starts
++			 * accepting variable number of planes.
++			 *
++			 * If bytesused == 0 for the output buffer, then fall
++			 * back to the full buffer size. In that case
++			 * userspace clearly never bothered to set it and
++			 * it's a safe assumption that they really meant to
++			 * use the full plane sizes.
++			 *
++			 * Some drivers, e.g. old codec drivers, use bytesused == 0
++			 * as a way to indicate that streaming is finished.
++			 * In that case, the driver should use the
++			 * allow_zero_bytesused flag to keep old userspace
++			 * applications working.
++			 */
++			for (plane = 0; plane < vb->num_planes; ++plane) {
++				struct vb2_plane *pdst = &planes[plane];
++				struct v4l2_plane *psrc = &b->m.planes[plane];
++
++				if (psrc->bytesused == 0)
++					vb2_warn_zero_bytesused(vb);
++
++				if (vb->vb2_queue->allow_zero_bytesused)
++					pdst->bytesused = psrc->bytesused;
++				else
++					pdst->bytesused = psrc->bytesused ?
++						psrc->bytesused : pdst->length;
++				pdst->data_offset = psrc->data_offset;
++			}
++		}
++	} else {
++		/*
++		 * Single-planar buffers do not use planes array,
++		 * so fill in relevant v4l2_buffer struct fields instead.
++		 * In videobuf we use our internal V4l2_planes struct for
++		 * single-planar buffers as well, for simplicity.
++		 *
++		 * If bytesused == 0 for the output buffer, then fall back
++		 * to the full buffer size as that's a sensible default.
++		 *
++		 * Some drivers, e.g. old codec drivers, use bytesused == 0 as
++		 * a way to indicate that streaming is finished. In that case,
++		 * the driver should use the allow_zero_bytesused flag to keep
++		 * old userspace applications working.
++		 */
++		switch (b->memory) {
++		case VB2_MEMORY_USERPTR:
++			planes[0].m.userptr = b->m.userptr;
++			planes[0].length = b->length;
++			break;
++		case VB2_MEMORY_DMABUF:
++			planes[0].m.fd = b->m.fd;
++			planes[0].length = b->length;
++			break;
++		default:
++			planes[0].m.offset = vb->planes[0].m.offset;
++			planes[0].length = vb->planes[0].length;
++			break;
++		}
++
++		planes[0].data_offset = 0;
++		if (V4L2_TYPE_IS_OUTPUT(b->type)) {
++			if (b->bytesused == 0)
++				vb2_warn_zero_bytesused(vb);
++
++			if (vb->vb2_queue->allow_zero_bytesused)
++				planes[0].bytesused = b->bytesused;
++			else
++				planes[0].bytesused = b->bytesused ?
++					b->bytesused : planes[0].length;
++		} else
++			planes[0].bytesused = 0;
++
++	}
++
++	/* Zero flags that we handle */
++	vbuf->flags = b->flags & ~V4L2_BUFFER_MASK_FLAGS;
++	if (!vb->vb2_queue->copy_timestamp || !V4L2_TYPE_IS_OUTPUT(b->type)) {
++		/*
++		 * Non-COPY timestamps and non-OUTPUT queues will get
++		 * their timestamp and timestamp source flags from the
++		 * queue.
++		 */
++		vbuf->flags &= ~V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
++	}
++
++	if (V4L2_TYPE_IS_OUTPUT(b->type)) {
++		/*
++		 * For output buffers mask out the timecode flag:
++		 * this will be handled later in vb2_qbuf().
++		 * The 'field' is valid metadata for this output buffer
++		 * and so that needs to be copied here.
++		 */
++		vbuf->flags &= ~V4L2_BUF_FLAG_TIMECODE;
++		vbuf->field = b->field;
++	} else {
++		/* Zero any output buffer flags as this is a capture buffer */
++		vbuf->flags &= ~V4L2_BUFFER_OUT_FLAGS;
++		/* Zero last flag, this is a signal from driver to userspace */
++		vbuf->flags &= ~V4L2_BUF_FLAG_LAST;
++	}
++
++	return 0;
++}
++
+ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+ 				    const char *opname)
+ {
++	struct vb2_v4l2_buffer *vbuf;
++	struct vb2_buffer *vb;
++	int ret;
++
+ 	if (b->type != q->type) {
+ 		dprintk(1, "%s: invalid buffer type\n", opname);
+ 		return -EINVAL;
+@@ -178,7 +346,15 @@ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+ 		return -EINVAL;
+ 	}
+ 
+-	return __verify_planes_array(q->bufs[b->index], b);
++	vb = q->bufs[b->index];
++	vbuf = to_vb2_v4l2_buffer(vb);
++	ret = __verify_planes_array(vb, b);
++	if (ret)
++		return ret;
++
++	/* Copy relevant information provided by the userspace */
++	memset(vbuf->planes, 0, sizeof(vbuf->planes[0]) * vb->num_planes);
++	return vb2_fill_vb2_v4l2_buffer(vb, b);
+ }
+ 
+ /*
+@@ -291,153 +467,22 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+  * v4l2_buffer by the userspace. It also verifies that struct
+  * v4l2_buffer has a valid number of planes.
+  */
+-static int __fill_vb2_buffer(struct vb2_buffer *vb,
+-		const void *pb, struct vb2_plane *planes)
++static int __fill_vb2_buffer(struct vb2_buffer *vb, struct vb2_plane *planes)
+ {
+-	struct vb2_queue *q = vb->vb2_queue;
+-	const struct v4l2_buffer *b = pb;
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	unsigned int plane;
+-	int ret;
+-
+-	ret = __verify_length(vb, b);
+-	if (ret < 0) {
+-		dprintk(1, "plane parameters verification failed: %d\n", ret);
+-		return ret;
+-	}
+-	if (b->field == V4L2_FIELD_ALTERNATE && q->is_output) {
+-		/*
+-		 * If the format's field is ALTERNATE, then the buffer's field
+-		 * should be either TOP or BOTTOM, not ALTERNATE since that
+-		 * makes no sense. The driver has to know whether the
+-		 * buffer represents a top or a bottom field in order to
+-		 * program any DMA correctly. Using ALTERNATE is wrong, since
+-		 * that just says that it is either a top or a bottom field,
+-		 * but not which of the two it is.
+-		 */
+-		dprintk(1, "the field is incorrectly set to ALTERNATE for an output buffer\n");
+-		return -EINVAL;
+-	}
+-	vb->timestamp = 0;
+-	vbuf->sequence = 0;
+-
+-	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+-		if (b->memory == VB2_MEMORY_USERPTR) {
+-			for (plane = 0; plane < vb->num_planes; ++plane) {
+-				planes[plane].m.userptr =
+-					b->m.planes[plane].m.userptr;
+-				planes[plane].length =
+-					b->m.planes[plane].length;
+-			}
+-		}
+-		if (b->memory == VB2_MEMORY_DMABUF) {
+-			for (plane = 0; plane < vb->num_planes; ++plane) {
+-				planes[plane].m.fd =
+-					b->m.planes[plane].m.fd;
+-				planes[plane].length =
+-					b->m.planes[plane].length;
+-			}
+-		}
+-
+-		/* Fill in driver-provided information for OUTPUT types */
+-		if (V4L2_TYPE_IS_OUTPUT(b->type)) {
+-			/*
+-			 * Will have to go up to b->length when API starts
+-			 * accepting variable number of planes.
+-			 *
+-			 * If bytesused == 0 for the output buffer, then fall
+-			 * back to the full buffer size. In that case
+-			 * userspace clearly never bothered to set it and
+-			 * it's a safe assumption that they really meant to
+-			 * use the full plane sizes.
+-			 *
+-			 * Some drivers, e.g. old codec drivers, use bytesused == 0
+-			 * as a way to indicate that streaming is finished.
+-			 * In that case, the driver should use the
+-			 * allow_zero_bytesused flag to keep old userspace
+-			 * applications working.
+-			 */
+-			for (plane = 0; plane < vb->num_planes; ++plane) {
+-				struct vb2_plane *pdst = &planes[plane];
+-				struct v4l2_plane *psrc = &b->m.planes[plane];
+-
+-				if (psrc->bytesused == 0)
+-					vb2_warn_zero_bytesused(vb);
+ 
+-				if (vb->vb2_queue->allow_zero_bytesused)
+-					pdst->bytesused = psrc->bytesused;
+-				else
+-					pdst->bytesused = psrc->bytesused ?
+-						psrc->bytesused : pdst->length;
+-				pdst->data_offset = psrc->data_offset;
+-			}
+-		}
+-	} else {
+-		/*
+-		 * Single-planar buffers do not use planes array,
+-		 * so fill in relevant v4l2_buffer struct fields instead.
+-		 * In videobuf we use our internal V4l2_planes struct for
+-		 * single-planar buffers as well, for simplicity.
+-		 *
+-		 * If bytesused == 0 for the output buffer, then fall back
+-		 * to the full buffer size as that's a sensible default.
+-		 *
+-		 * Some drivers, e.g. old codec drivers, use bytesused == 0 as
+-		 * a way to indicate that streaming is finished. In that case,
+-		 * the driver should use the allow_zero_bytesused flag to keep
+-		 * old userspace applications working.
+-		 */
+-		if (b->memory == VB2_MEMORY_USERPTR) {
+-			planes[0].m.userptr = b->m.userptr;
+-			planes[0].length = b->length;
+-		}
++	if (!vb->vb2_queue->is_output || !vb->vb2_queue->copy_timestamp)
++		vb->timestamp = 0;
+ 
+-		if (b->memory == VB2_MEMORY_DMABUF) {
+-			planes[0].m.fd = b->m.fd;
+-			planes[0].length = b->length;
++	for (plane = 0; plane < vb->num_planes; ++plane) {
++		if (vb->vb2_queue->memory != VB2_MEMORY_MMAP) {
++			planes[plane].m = vbuf->planes[plane].m;
++			planes[plane].length = vbuf->planes[plane].length;
+ 		}
+-
+-		if (V4L2_TYPE_IS_OUTPUT(b->type)) {
+-			if (b->bytesused == 0)
+-				vb2_warn_zero_bytesused(vb);
+-
+-			if (vb->vb2_queue->allow_zero_bytesused)
+-				planes[0].bytesused = b->bytesused;
+-			else
+-				planes[0].bytesused = b->bytesused ?
+-					b->bytesused : planes[0].length;
+-		} else
+-			planes[0].bytesused = 0;
+-
+-	}
+-
+-	/* Zero flags that the vb2 core handles */
+-	vbuf->flags = b->flags & ~V4L2_BUFFER_MASK_FLAGS;
+-	if (!vb->vb2_queue->copy_timestamp || !V4L2_TYPE_IS_OUTPUT(b->type)) {
+-		/*
+-		 * Non-COPY timestamps and non-OUTPUT queues will get
+-		 * their timestamp and timestamp source flags from the
+-		 * queue.
+-		 */
+-		vbuf->flags &= ~V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
++		planes[plane].bytesused = vbuf->planes[plane].bytesused;
++		planes[plane].data_offset = vbuf->planes[plane].data_offset;
+ 	}
+-
+-	if (V4L2_TYPE_IS_OUTPUT(b->type)) {
+-		/*
+-		 * For output buffers mask out the timecode flag:
+-		 * this will be handled later in vb2_qbuf().
+-		 * The 'field' is valid metadata for this output buffer
+-		 * and so that needs to be copied here.
+-		 */
+-		vbuf->flags &= ~V4L2_BUF_FLAG_TIMECODE;
+-		vbuf->field = b->field;
+-	} else {
+-		/* Zero any output buffer flags as this is a capture buffer */
+-		vbuf->flags &= ~V4L2_BUFFER_OUT_FLAGS;
+-		/* Zero last flag, this is a signal from driver to userspace */
+-		vbuf->flags &= ~V4L2_BUF_FLAG_LAST;
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/dvb-core/dvb_vb2.c b/drivers/media/dvb-core/dvb_vb2.c
+index b811adf88afa..da6a8cec7d42 100644
+--- a/drivers/media/dvb-core/dvb_vb2.c
++++ b/drivers/media/dvb-core/dvb_vb2.c
+@@ -146,8 +146,7 @@ static void _fill_dmx_buffer(struct vb2_buffer *vb, void *pb)
+ 	dprintk(3, "[%s]\n", ctx->name);
+ }
+ 
+-static int _fill_vb2_buffer(struct vb2_buffer *vb,
+-			    const void *pb, struct vb2_plane *planes)
++static int _fill_vb2_buffer(struct vb2_buffer *vb, struct vb2_plane *planes)
+ {
+ 	struct dvb_vb2_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index f6818f732f34..224c4820a044 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -417,8 +417,7 @@ struct vb2_ops {
+ struct vb2_buf_ops {
+ 	int (*verify_planes_array)(struct vb2_buffer *vb, const void *pb);
+ 	void (*fill_user_buffer)(struct vb2_buffer *vb, void *pb);
+-	int (*fill_vb2_buffer)(struct vb2_buffer *vb, const void *pb,
+-				struct vb2_plane *planes);
++	int (*fill_vb2_buffer)(struct vb2_buffer *vb, struct vb2_plane *planes);
+ 	void (*copy_timestamp)(struct vb2_buffer *vb, const void *pb);
+ };
+ 
+diff --git a/include/media/videobuf2-v4l2.h b/include/media/videobuf2-v4l2.h
+index 3d5e2d739f05..097bf3e6951d 100644
+--- a/include/media/videobuf2-v4l2.h
++++ b/include/media/videobuf2-v4l2.h
+@@ -32,6 +32,7 @@
+  *		&enum v4l2_field.
+  * @timecode:	frame timecode.
+  * @sequence:	sequence count of this frame.
++ * @planes:	plane information (userptr/fd, length, bytesused, data_offset).
+  *
+  * Should contain enough information to be able to cover all the fields
+  * of &struct v4l2_buffer at ``videodev2.h``.
+@@ -43,6 +44,7 @@ struct vb2_v4l2_buffer {
+ 	__u32			field;
+ 	struct v4l2_timecode	timecode;
+ 	__u32			sequence;
++	struct vb2_plane	planes[VB2_MAX_PLANES];
+ };
+ 
+ /*
+-- 
+2.18.0
+
+From 18bb423db3023745ada22e5e9d20a29fe9767653 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Sun, 3 Jun 2018 11:00:25 +0200
+Subject: [PATCH 17/34] davinci_vpfe: remove bogus vb2->state check
+
+There is no need to check the vb2 state in the buf_prepare
+callback: it can never be wrong.
+
+Since VB2_BUF_STATE_PREPARED will be removed in the next patch
+we'll remove this unnecessary check (and use of that state) first.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/staging/media/davinci_vpfe/vpfe_video.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/drivers/staging/media/davinci_vpfe/vpfe_video.c b/drivers/staging/media/davinci_vpfe/vpfe_video.c
+index 1269a983455e..4e3ec7fdc90d 100644
+--- a/drivers/staging/media/davinci_vpfe/vpfe_video.c
++++ b/drivers/staging/media/davinci_vpfe/vpfe_video.c
+@@ -1135,10 +1135,6 @@ static int vpfe_buffer_prepare(struct vb2_buffer *vb)
+ 
+ 	v4l2_dbg(1, debug, &vpfe_dev->v4l2_dev, "vpfe_buffer_prepare\n");
+ 
+-	if (vb->state != VB2_BUF_STATE_ACTIVE &&
+-	    vb->state != VB2_BUF_STATE_PREPARED)
+-		return 0;
+-
+ 	/* Initialize buffer */
+ 	vb2_set_plane_payload(vb, 0, video->fmt.fmt.pix.sizeimage);
+ 	if (vb2_plane_vaddr(vb, 0) &&
+-- 
+2.18.0
+
+From 6d3aa252bcf025ebf34924894a9cd1950b3fb6e4 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Sun, 3 Jun 2018 11:02:27 +0200
+Subject: [PATCH 18/34] vb2: drop VB2_BUF_STATE_PREPARED, use bool
+ prepared/synced instead
+
+The PREPARED state becomes a problem with the request API: a buffer
+could be PREPARED but dequeued, or PREPARED and in state IN_REQUEST.
+
+PREPARED is really not a state as such, but more a property of the
+buffer. So make new 'prepared' and 'synced' bools instead to remember
+whether the buffer is prepared and/or synced or not.
+
+V4L2_BUF_FLAG_PREPARED is only set if the buffer is both synced and
+prepared and in the DEQUEUED state.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-core.c   | 38 +++++++++++++------
+ .../media/common/videobuf2/videobuf2-v4l2.c   | 16 +++++---
+ include/media/videobuf2-core.h                |  6 ++-
+ 3 files changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index c25bad134ba3..997673b62afc 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -682,7 +682,7 @@ int vb2_core_reqbufs(struct vb2_queue *q, enum vb2_memory memory,
+ 		}
+ 
+ 		/*
+-		 * Call queue_cancel to clean up any buffers in the PREPARED or
++		 * Call queue_cancel to clean up any buffers in the
+ 		 * QUEUED state which is possible if buffers were prepared or
+ 		 * queued without ever calling STREAMON.
+ 		 */
+@@ -921,6 +921,7 @@ void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
+ 		/* sync buffers */
+ 		for (plane = 0; plane < vb->num_planes; ++plane)
+ 			call_void_memop(vb, finish, vb->planes[plane].mem_priv);
++		vb->synced = false;
+ 	}
+ 
+ 	spin_lock_irqsave(&q->done_lock, flags);
+@@ -1239,6 +1240,7 @@ static void __enqueue_in_driver(struct vb2_buffer *vb)
+ static int __buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct vb2_queue *q = vb->vb2_queue;
++	enum vb2_buffer_state orig_state = vb->state;
+ 	unsigned int plane;
+ 	int ret;
+ 
+@@ -1247,6 +1249,10 @@ static int __buf_prepare(struct vb2_buffer *vb)
+ 		return -EIO;
+ 	}
+ 
++	if (vb->prepared)
++		return 0;
++	WARN_ON(vb->synced);
++
+ 	vb->state = VB2_BUF_STATE_PREPARING;
+ 
+ 	switch (q->memory) {
+@@ -1262,11 +1268,12 @@ static int __buf_prepare(struct vb2_buffer *vb)
+ 	default:
+ 		WARN(1, "Invalid queue type\n");
+ 		ret = -EINVAL;
++		break;
+ 	}
+ 
+ 	if (ret) {
+ 		dprintk(1, "buffer preparation failed: %d\n", ret);
+-		vb->state = VB2_BUF_STATE_DEQUEUED;
++		vb->state = orig_state;
+ 		return ret;
+ 	}
+ 
+@@ -1274,7 +1281,9 @@ static int __buf_prepare(struct vb2_buffer *vb)
+ 	for (plane = 0; plane < vb->num_planes; ++plane)
+ 		call_void_memop(vb, prepare, vb->planes[plane].mem_priv);
+ 
+-	vb->state = VB2_BUF_STATE_PREPARED;
++	vb->synced = true;
++	vb->prepared = true;
++	vb->state = orig_state;
+ 
+ 	return 0;
+ }
+@@ -1290,6 +1299,10 @@ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb)
+ 			vb->state);
+ 		return -EINVAL;
+ 	}
++	if (vb->prepared) {
++		dprintk(1, "buffer already prepared\n");
++		return -EINVAL;
++	}
+ 
+ 	ret = __buf_prepare(vb);
+ 	if (ret)
+@@ -1376,11 +1389,11 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb)
+ 
+ 	switch (vb->state) {
+ 	case VB2_BUF_STATE_DEQUEUED:
+-		ret = __buf_prepare(vb);
+-		if (ret)
+-			return ret;
+-		break;
+-	case VB2_BUF_STATE_PREPARED:
++		if (!vb->prepared) {
++			ret = __buf_prepare(vb);
++			if (ret)
++				return ret;
++		}
+ 		break;
+ 	case VB2_BUF_STATE_PREPARING:
+ 		dprintk(1, "buffer still being prepared\n");
+@@ -1606,6 +1619,7 @@ int vb2_core_dqbuf(struct vb2_queue *q, unsigned int *pindex, void *pb,
+ 	}
+ 
+ 	call_void_vb_qop(vb, buf_finish, vb);
++	vb->prepared = false;
+ 
+ 	if (pindex)
+ 		*pindex = vb->index;
+@@ -1694,18 +1708,18 @@ static void __vb2_queue_cancel(struct vb2_queue *q)
+ 	for (i = 0; i < q->num_buffers; ++i) {
+ 		struct vb2_buffer *vb = q->bufs[i];
+ 
+-		if (vb->state == VB2_BUF_STATE_PREPARED ||
+-		    vb->state == VB2_BUF_STATE_QUEUED) {
++		if (vb->synced) {
+ 			unsigned int plane;
+ 
+ 			for (plane = 0; plane < vb->num_planes; ++plane)
+ 				call_void_memop(vb, finish,
+ 						vb->planes[plane].mem_priv);
++			vb->synced = false;
+ 		}
+ 
+-		if (vb->state != VB2_BUF_STATE_DEQUEUED) {
+-			vb->state = VB2_BUF_STATE_PREPARED;
++		if (vb->prepared) {
+ 			call_void_vb_qop(vb, buf_finish, vb);
++			vb->prepared = false;
+ 		}
+ 		__vb2_dqbuf(vb);
+ 	}
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index 360dc4e7d413..a677e2c26247 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -352,9 +352,13 @@ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Copy relevant information provided by the userspace */
+-	memset(vbuf->planes, 0, sizeof(vbuf->planes[0]) * vb->num_planes);
+-	return vb2_fill_vb2_v4l2_buffer(vb, b);
++	if (!vb->prepared) {
++		/* Copy relevant information provided by the userspace */
++		memset(vbuf->planes, 0,
++		       sizeof(vbuf->planes[0]) * vb->num_planes);
++		ret = vb2_fill_vb2_v4l2_buffer(vb, b);
++	}
++	return ret;
+ }
+ 
+ /*
+@@ -443,9 +447,6 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 	case VB2_BUF_STATE_DONE:
+ 		b->flags |= V4L2_BUF_FLAG_DONE;
+ 		break;
+-	case VB2_BUF_STATE_PREPARED:
+-		b->flags |= V4L2_BUF_FLAG_PREPARED;
+-		break;
+ 	case VB2_BUF_STATE_PREPARING:
+ 	case VB2_BUF_STATE_DEQUEUED:
+ 	case VB2_BUF_STATE_REQUEUEING:
+@@ -453,6 +454,9 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 		break;
+ 	}
+ 
++	if (vb->state == VB2_BUF_STATE_DEQUEUED && vb->synced && vb->prepared)
++		b->flags |= V4L2_BUF_FLAG_PREPARED;
++
+ 	if (vb2_buffer_in_use(q, vb))
+ 		b->flags |= V4L2_BUF_FLAG_MAPPED;
+ 
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index 224c4820a044..5e760d5f280a 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -204,7 +204,6 @@ enum vb2_io_modes {
+  * enum vb2_buffer_state - current video buffer state.
+  * @VB2_BUF_STATE_DEQUEUED:	buffer under userspace control.
+  * @VB2_BUF_STATE_PREPARING:	buffer is being prepared in videobuf.
+- * @VB2_BUF_STATE_PREPARED:	buffer prepared in videobuf and by the driver.
+  * @VB2_BUF_STATE_QUEUED:	buffer queued in videobuf, but not in driver.
+  * @VB2_BUF_STATE_REQUEUEING:	re-queue a buffer to the driver.
+  * @VB2_BUF_STATE_ACTIVE:	buffer queued in driver and possibly used
+@@ -218,7 +217,6 @@ enum vb2_io_modes {
+ enum vb2_buffer_state {
+ 	VB2_BUF_STATE_DEQUEUED,
+ 	VB2_BUF_STATE_PREPARING,
+-	VB2_BUF_STATE_PREPARED,
+ 	VB2_BUF_STATE_QUEUED,
+ 	VB2_BUF_STATE_REQUEUEING,
+ 	VB2_BUF_STATE_ACTIVE,
+@@ -250,6 +248,8 @@ struct vb2_buffer {
+ 	/* private: internal use only
+ 	 *
+ 	 * state:		current buffer state; do not change
++	 * synced:		this buffer has been synced
++	 * prepared:		this buffer has been prepared
+ 	 * queued_entry:	entry on the queued buffers list, which holds
+ 	 *			all buffers queued from userspace
+ 	 * done_entry:		entry on the list that stores all buffers ready
+@@ -257,6 +257,8 @@ struct vb2_buffer {
+ 	 * vb2_plane:		per-plane information; do not change
+ 	 */
+ 	enum vb2_buffer_state	state;
++	bool			synced;
++	bool			prepared;
+ 
+ 	struct vb2_plane	planes[VB2_MAX_PLANES];
+ 	struct list_head	queued_entry;
+-- 
+2.18.0
+
+From 61deed07d0ff87353d04e9600bebd05911fc8a02 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:44 +0300
+Subject: [PATCH 19/34] videodev2.h: Add request_fd field to v4l2_buffer
+
+When queuing buffers allow for passing the request that should
+be associated with this buffer.
+
+If V4L2_BUF_FLAG_REQUEST_FD is set, then request_fd is used as
+the file descriptor.
+
+If a buffer is stored in a request, but not yet queued to the
+driver, then V4L2_BUF_FLAG_IN_REQUEST is set.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/common/videobuf2/videobuf2-v4l2.c |  2 +-
+ drivers/media/usb/cpia2/cpia2_v4l.c             |  2 +-
+ drivers/media/v4l2-core/v4l2-compat-ioctl32.c   |  9 ++++++---
+ drivers/media/v4l2-core/v4l2-ioctl.c            |  4 ++--
+ include/uapi/linux/videodev2.h                  | 10 +++++++++-
+ 5 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index a677e2c26247..64905d87465c 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -384,7 +384,7 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 	b->timecode = vbuf->timecode;
+ 	b->sequence = vbuf->sequence;
+ 	b->reserved2 = 0;
+-	b->reserved = 0;
++	b->request_fd = 0;
+ 
+ 	if (q->is_multiplanar) {
+ 		/*
+diff --git a/drivers/media/usb/cpia2/cpia2_v4l.c b/drivers/media/usb/cpia2/cpia2_v4l.c
+index 99f106b13280..13aee9f67d05 100644
+--- a/drivers/media/usb/cpia2/cpia2_v4l.c
++++ b/drivers/media/usb/cpia2/cpia2_v4l.c
+@@ -949,7 +949,7 @@ static int cpia2_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
+ 	buf->m.offset = cam->buffers[buf->index].data - cam->frame_buffer;
+ 	buf->length = cam->frame_size;
+ 	buf->reserved2 = 0;
+-	buf->reserved = 0;
++	buf->request_fd = 0;
+ 	memset(&buf->timecode, 0, sizeof(buf->timecode));
+ 
+ 	DBG("DQBUF #%d status:%d seq:%d length:%d\n", buf->index,
+diff --git a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+index dcce86c1fe40..633465d21d04 100644
+--- a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
++++ b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+@@ -482,7 +482,7 @@ struct v4l2_buffer32 {
+ 	} m;
+ 	__u32			length;
+ 	__u32			reserved2;
+-	__u32			reserved;
++	__s32			request_fd;
+ };
+ 
+ static int get_v4l2_plane32(struct v4l2_plane __user *p64,
+@@ -581,6 +581,7 @@ static int get_v4l2_buffer32(struct v4l2_buffer __user *p64,
+ {
+ 	u32 type;
+ 	u32 length;
++	s32 request_fd;
+ 	enum v4l2_memory memory;
+ 	struct v4l2_plane32 __user *uplane32;
+ 	struct v4l2_plane __user *uplane;
+@@ -595,7 +596,9 @@ static int get_v4l2_buffer32(struct v4l2_buffer __user *p64,
+ 	    get_user(memory, &p32->memory) ||
+ 	    put_user(memory, &p64->memory) ||
+ 	    get_user(length, &p32->length) ||
+-	    put_user(length, &p64->length))
++	    put_user(length, &p64->length) ||
++	    get_user(request_fd, &p32->request_fd) ||
++	    put_user(request_fd, &p64->request_fd))
+ 		return -EFAULT;
+ 
+ 	if (V4L2_TYPE_IS_OUTPUT(type))
+@@ -699,7 +702,7 @@ static int put_v4l2_buffer32(struct v4l2_buffer __user *p64,
+ 	    copy_in_user(&p32->timecode, &p64->timecode, sizeof(p64->timecode)) ||
+ 	    assign_in_user(&p32->sequence, &p64->sequence) ||
+ 	    assign_in_user(&p32->reserved2, &p64->reserved2) ||
+-	    assign_in_user(&p32->reserved, &p64->reserved) ||
++	    assign_in_user(&p32->request_fd, &p64->request_fd) ||
+ 	    get_user(length, &p64->length) ||
+ 	    put_user(length, &p32->length))
+ 		return -EFAULT;
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index cc657e5261b7..44fc0102221f 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -474,13 +474,13 @@ static void v4l_print_buffer(const void *arg, bool write_only)
+ 	const struct v4l2_plane *plane;
+ 	int i;
+ 
+-	pr_cont("%02ld:%02d:%02d.%08ld index=%d, type=%s, flags=0x%08x, field=%s, sequence=%d, memory=%s",
++	pr_cont("%02ld:%02d:%02d.%08ld index=%d, type=%s, request_fd=%d, flags=0x%08x, field=%s, sequence=%d, memory=%s",
+ 			p->timestamp.tv_sec / 3600,
+ 			(int)(p->timestamp.tv_sec / 60) % 60,
+ 			(int)(p->timestamp.tv_sec % 60),
+ 			(long)p->timestamp.tv_usec,
+ 			p->index,
+-			prt_names(p->type, v4l2_type_names),
++			prt_names(p->type, v4l2_type_names), p->request_fd,
+ 			p->flags, prt_names(p->field, v4l2_field_names),
+ 			p->sequence, prt_names(p->memory, v4l2_memory_names));
+ 
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 16b53b82496c..1f6c4b52baae 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -910,6 +910,7 @@ struct v4l2_plane {
+  * @length:	size in bytes of the buffer (NOT its payload) for single-plane
+  *		buffers (when type != *_MPLANE); number of elements in the
+  *		planes array for multi-plane buffers
++ * @request_fd: fd of the request that this buffer should use
+  *
+  * Contains data exchanged by application and driver using one of the Streaming
+  * I/O methods.
+@@ -934,7 +935,10 @@ struct v4l2_buffer {
+ 	} m;
+ 	__u32			length;
+ 	__u32			reserved2;
+-	__u32			reserved;
++	union {
++		__s32		request_fd;
++		__u32		reserved;
++	};
+ };
+ 
+ /*  Flags for 'flags' field */
+@@ -952,6 +956,8 @@ struct v4l2_buffer {
+ #define V4L2_BUF_FLAG_BFRAME			0x00000020
+ /* Buffer is ready, but the data contained within is corrupted. */
+ #define V4L2_BUF_FLAG_ERROR			0x00000040
++/* Buffer is added to an unqueued request */
++#define V4L2_BUF_FLAG_IN_REQUEST		0x00000080
+ /* timecode field is valid */
+ #define V4L2_BUF_FLAG_TIMECODE			0x00000100
+ /* Buffer is prepared for queuing */
+@@ -970,6 +976,8 @@ struct v4l2_buffer {
+ #define V4L2_BUF_FLAG_TSTAMP_SRC_SOE		0x00010000
+ /* mem2mem encoder/decoder */
+ #define V4L2_BUF_FLAG_LAST			0x00100000
++/* request_fd is valid */
++#define V4L2_BUF_FLAG_REQUEST_FD		0x00800000
+ 
+ /**
+  * struct v4l2_exportbuffer - export of video buffer as DMABUF file descriptor
+-- 
+2.18.0
+
+From 87ea4517c3182ee2f805180e5fc9ae5ab3f285f7 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Fri, 1 Jun 2018 17:03:13 +0200
+Subject: [PATCH 20/34] vb2: add init_buffer buffer op
+
+We need to initialize the request_fd field in struct vb2_v4l2_buffer
+to -1 instead of the default of 0. So we need to add a new op that
+is called when struct vb2_v4l2_buffer is allocated.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/common/videobuf2/videobuf2-core.c | 2 ++
+ include/media/videobuf2-core.h                  | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index 997673b62afc..a9e958df8324 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -356,6 +356,8 @@ static int __vb2_queue_alloc(struct vb2_queue *q, enum vb2_memory memory,
+ 			vb->planes[plane].length = plane_sizes[plane];
+ 			vb->planes[plane].min_length = plane_sizes[plane];
+ 		}
++		call_void_bufop(q, init_buffer, vb);
++
+ 		q->bufs[vb->index] = vb;
+ 
+ 		/* Allocate video buffer memory for the MMAP type */
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index 5e760d5f280a..cbda3968d018 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -408,6 +408,9 @@ struct vb2_ops {
+  * @verify_planes_array: Verify that a given user space structure contains
+  *			enough planes for the buffer. This is called
+  *			for each dequeued buffer.
++ * @init_buffer:	given a &vb2_buffer initialize the extra data after
++ *			struct vb2_buffer.
++ *			For V4L2 this is a &struct vb2_v4l2_buffer.
+  * @fill_user_buffer:	given a &vb2_buffer fill in the userspace structure.
+  *			For V4L2 this is a &struct v4l2_buffer.
+  * @fill_vb2_buffer:	given a userspace structure, fill in the &vb2_buffer.
+@@ -418,6 +421,7 @@ struct vb2_ops {
+  */
+ struct vb2_buf_ops {
+ 	int (*verify_planes_array)(struct vb2_buffer *vb, const void *pb);
++	void (*init_buffer)(struct vb2_buffer *vb);
+ 	void (*fill_user_buffer)(struct vb2_buffer *vb, void *pb);
+ 	int (*fill_vb2_buffer)(struct vb2_buffer *vb, struct vb2_plane *planes);
+ 	void (*copy_timestamp)(struct vb2_buffer *vb, const void *pb);
+-- 
+2.18.0
+
+From 8fb804ff3736770ef613161bfa91c7866586a22e Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:46 +0300
+Subject: [PATCH 21/34] videobuf2-core: embed media_request_object
+
+Make vb2_buffer a request object.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ include/media/videobuf2-core.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index cbda3968d018..df92dcdeabb3 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -17,6 +17,7 @@
+ #include <linux/poll.h>
+ #include <linux/dma-buf.h>
+ #include <linux/bitops.h>
++#include <media/media-request.h>
+ 
+ #define VB2_MAX_FRAME	(32)
+ #define VB2_MAX_PLANES	(8)
+@@ -236,6 +237,8 @@ struct vb2_queue;
+  * @num_planes:		number of planes in the buffer
+  *			on an internal driver queue.
+  * @timestamp:		frame timestamp in ns.
++ * @req_obj:		used to bind this buffer to a request. This
++ *			request object has a refcount.
+  */
+ struct vb2_buffer {
+ 	struct vb2_queue	*vb2_queue;
+@@ -244,6 +247,7 @@ struct vb2_buffer {
+ 	unsigned int		memory;
+ 	unsigned int		num_planes;
+ 	u64			timestamp;
++	struct media_request_object	req_obj;
+ 
+ 	/* private: internal use only
+ 	 *
+-- 
+2.18.0
+
+From 488b6ddc70ca26c2e6fc880f3143594ad5fba6eb Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:47 +0300
+Subject: [PATCH 22/34] videobuf2-core: integrate with media requests
+
+Buffers can now be prepared or queued for a request.
+
+A buffer is unbound from the request at vb2_buffer_done time or
+when the queue is cancelled.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-core.c   | 133 +++++++++++++++++-
+ .../media/common/videobuf2/videobuf2-v4l2.c   |   4 +-
+ drivers/media/dvb-core/dvb_vb2.c              |   2 +-
+ include/media/videobuf2-core.h                |  18 ++-
+ 4 files changed, 147 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index a9e958df8324..6d423bc5a1a1 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -499,8 +499,9 @@ static int __vb2_queue_free(struct vb2_queue *q, unsigned int buffers)
+ 			pr_info("     buf_init: %u buf_cleanup: %u buf_prepare: %u buf_finish: %u\n",
+ 				vb->cnt_buf_init, vb->cnt_buf_cleanup,
+ 				vb->cnt_buf_prepare, vb->cnt_buf_finish);
+-			pr_info("     buf_queue: %u buf_done: %u\n",
+-				vb->cnt_buf_queue, vb->cnt_buf_done);
++			pr_info("     buf_queue: %u buf_done: %u buf_request_complete: %u\n",
++				vb->cnt_buf_queue, vb->cnt_buf_done,
++				vb->cnt_buf_request_complete);
+ 			pr_info("     alloc: %u put: %u prepare: %u finish: %u mmap: %u\n",
+ 				vb->cnt_mem_alloc, vb->cnt_mem_put,
+ 				vb->cnt_mem_prepare, vb->cnt_mem_finish,
+@@ -936,6 +937,14 @@ void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
+ 		vb->state = state;
+ 	}
+ 	atomic_dec(&q->owned_by_drv_count);
++
++	if (vb->req_obj.req) {
++		/* This is not supported at the moment */
++		WARN_ON(state == VB2_BUF_STATE_REQUEUEING);
++		media_request_object_unbind(&vb->req_obj);
++		media_request_object_put(&vb->req_obj);
++	}
++
+ 	spin_unlock_irqrestore(&q->done_lock, flags);
+ 
+ 	trace_vb2_buf_done(q, vb);
+@@ -1290,6 +1299,60 @@ static int __buf_prepare(struct vb2_buffer *vb)
+ 	return 0;
+ }
+ 
++static int vb2_req_prepare(struct media_request_object *obj)
++{
++	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
++	int ret;
++
++	if (WARN_ON(vb->state != VB2_BUF_STATE_IN_REQUEST))
++		return -EINVAL;
++
++	mutex_lock(vb->vb2_queue->lock);
++	ret = __buf_prepare(vb);
++	mutex_unlock(vb->vb2_queue->lock);
++	return ret;
++}
++
++static void __vb2_dqbuf(struct vb2_buffer *vb);
++
++static void vb2_req_unprepare(struct media_request_object *obj)
++{
++	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
++
++	mutex_lock(vb->vb2_queue->lock);
++	__vb2_dqbuf(vb);
++	vb->state = VB2_BUF_STATE_IN_REQUEST;
++	mutex_unlock(vb->vb2_queue->lock);
++	WARN_ON(!vb->req_obj.req);
++}
++
++int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
++		  struct media_request *req);
++
++static void vb2_req_queue(struct media_request_object *obj)
++{
++	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
++
++	mutex_lock(vb->vb2_queue->lock);
++	vb2_core_qbuf(vb->vb2_queue, vb->index, NULL, NULL);
++	mutex_unlock(vb->vb2_queue->lock);
++}
++
++static void vb2_req_release(struct media_request_object *obj)
++{
++	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
++
++	if (vb->state == VB2_BUF_STATE_IN_REQUEST)
++		vb->state = VB2_BUF_STATE_DEQUEUED;
++}
++
++static const struct media_request_object_ops vb2_core_req_ops = {
++	.prepare = vb2_req_prepare,
++	.unprepare = vb2_req_unprepare,
++	.queue = vb2_req_queue,
++	.release = vb2_req_release,
++};
++
+ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb)
+ {
+ 	struct vb2_buffer *vb;
+@@ -1315,7 +1378,7 @@ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb)
+ 
+ 	dprintk(2, "prepare of buffer %d succeeded\n", vb->index);
+ 
+-	return ret;
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(vb2_core_prepare_buf);
+ 
+@@ -1382,15 +1445,47 @@ static int vb2_start_streaming(struct vb2_queue *q)
+ 	return ret;
+ }
+ 
+-int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb)
++int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
++		  struct media_request *req)
+ {
+ 	struct vb2_buffer *vb;
+ 	int ret;
+ 
+ 	vb = q->bufs[index];
+ 
++	if (req) {
++		int ret;
++
++		if (vb->state != VB2_BUF_STATE_DEQUEUED) {
++			dprintk(1, "buffer %d not in dequeued state\n",
++				vb->index);
++			return -EINVAL;
++		}
++
++		media_request_object_init(&vb->req_obj);
++
++		/* Make sure the request is in a safe state for updating. */
++		ret = media_request_lock_for_update(req);
++		if (ret)
++			return ret;
++		ret = media_request_object_bind(req, &vb2_core_req_ops,
++						q, &vb->req_obj);
++		media_request_unlock_for_update(req);
++		if (ret)
++			return ret;
++
++		vb->state = VB2_BUF_STATE_IN_REQUEST;
++		/* Fill buffer information for the userspace */
++		if (pb)
++			call_void_bufop(q, fill_user_buffer, vb, pb);
++
++		dprintk(2, "qbuf of buffer %d succeeded\n", vb->index);
++		return 0;
++	}
++
+ 	switch (vb->state) {
+ 	case VB2_BUF_STATE_DEQUEUED:
++	case VB2_BUF_STATE_IN_REQUEST:
+ 		if (!vb->prepared) {
+ 			ret = __buf_prepare(vb);
+ 			if (ret)
+@@ -1596,6 +1691,11 @@ static void __vb2_dqbuf(struct vb2_buffer *vb)
+ 			call_void_memop(vb, unmap_dmabuf, vb->planes[i].mem_priv);
+ 			vb->planes[i].dbuf_mapped = 0;
+ 		}
++	if (vb->req_obj.req) {
++		media_request_object_unbind(&vb->req_obj);
++		media_request_object_put(&vb->req_obj);
++	}
++	call_void_bufop(q, init_buffer, vb);
+ }
+ 
+ int vb2_core_dqbuf(struct vb2_queue *q, unsigned int *pindex, void *pb,
+@@ -1709,6 +1809,25 @@ static void __vb2_queue_cancel(struct vb2_queue *q)
+ 	 */
+ 	for (i = 0; i < q->num_buffers; ++i) {
+ 		struct vb2_buffer *vb = q->bufs[i];
++		struct media_request *req = vb->req_obj.req;
++
++		/*
++		 * If a request is associated with this buffer, then
++		 * call buf_request_cancel() to give the driver to complete()
++		 * related request objects. Otherwise those objects would
++		 * never complete.
++		 */
++		if (req) {
++			enum media_request_state state;
++			unsigned long flags;
++
++			spin_lock_irqsave(&req->lock, flags);
++			state = req->state;
++			spin_unlock_irqrestore(&req->lock, flags);
++
++			if (state == MEDIA_REQUEST_STATE_QUEUED)
++				call_void_vb_qop(vb, buf_request_complete, vb);
++		}
+ 
+ 		if (vb->synced) {
+ 			unsigned int plane;
+@@ -2278,7 +2397,7 @@ static int __vb2_init_fileio(struct vb2_queue *q, int read)
+ 		 * Queue all buffers.
+ 		 */
+ 		for (i = 0; i < q->num_buffers; i++) {
+-			ret = vb2_core_qbuf(q, i, NULL);
++			ret = vb2_core_qbuf(q, i, NULL, NULL);
+ 			if (ret)
+ 				goto err_reqbufs;
+ 			fileio->bufs[i].queued = 1;
+@@ -2457,7 +2576,7 @@ static size_t __vb2_perform_fileio(struct vb2_queue *q, char __user *data, size_
+ 
+ 		if (copy_timestamp)
+ 			b->timestamp = ktime_get_ns();
+-		ret = vb2_core_qbuf(q, index, NULL);
++		ret = vb2_core_qbuf(q, index, NULL, NULL);
+ 		dprintk(5, "vb2_dbuf result: %d\n", ret);
+ 		if (ret)
+ 			return ret;
+@@ -2560,7 +2679,7 @@ static int vb2_thread(void *data)
+ 		if (copy_timestamp)
+ 			vb->timestamp = ktime_get_ns();
+ 		if (!threadio->stop)
+-			ret = vb2_core_qbuf(q, vb->index, NULL);
++			ret = vb2_core_qbuf(q, vb->index, NULL, NULL);
+ 		call_void_qop(q, wait_prepare, q);
+ 		if (ret || threadio->stop)
+ 			break;
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index 64905d87465c..ea9db4b3f59a 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -441,6 +441,8 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 	case VB2_BUF_STATE_ACTIVE:
+ 		b->flags |= V4L2_BUF_FLAG_QUEUED;
+ 		break;
++	case VB2_BUF_STATE_IN_REQUEST:
++		break;
+ 	case VB2_BUF_STATE_ERROR:
+ 		b->flags |= V4L2_BUF_FLAG_ERROR;
+ 		/* fall through */
+@@ -619,7 +621,7 @@ int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b)
+ 	}
+ 
+ 	ret = vb2_queue_or_prepare_buf(q, b, "qbuf");
+-	return ret ? ret : vb2_core_qbuf(q, b->index, b);
++	return ret ? ret : vb2_core_qbuf(q, b->index, b, NULL);
+ }
+ EXPORT_SYMBOL_GPL(vb2_qbuf);
+ 
+diff --git a/drivers/media/dvb-core/dvb_vb2.c b/drivers/media/dvb-core/dvb_vb2.c
+index da6a8cec7d42..f1e7f0536028 100644
+--- a/drivers/media/dvb-core/dvb_vb2.c
++++ b/drivers/media/dvb-core/dvb_vb2.c
+@@ -384,7 +384,7 @@ int dvb_vb2_qbuf(struct dvb_vb2_ctx *ctx, struct dmx_buffer *b)
+ {
+ 	int ret;
+ 
+-	ret = vb2_core_qbuf(&ctx->vb_q, b->index, b);
++	ret = vb2_core_qbuf(&ctx->vb_q, b->index, b, NULL);
+ 	if (ret) {
+ 		dprintk(1, "[%s] index=%d errno=%d\n", ctx->name,
+ 			b->index, ret);
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index df92dcdeabb3..8a8d7732d182 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -204,6 +204,7 @@ enum vb2_io_modes {
+ /**
+  * enum vb2_buffer_state - current video buffer state.
+  * @VB2_BUF_STATE_DEQUEUED:	buffer under userspace control.
++ * @VB2_BUF_STATE_IN_REQUEST:	buffer is queued in media request.
+  * @VB2_BUF_STATE_PREPARING:	buffer is being prepared in videobuf.
+  * @VB2_BUF_STATE_QUEUED:	buffer queued in videobuf, but not in driver.
+  * @VB2_BUF_STATE_REQUEUEING:	re-queue a buffer to the driver.
+@@ -217,6 +218,7 @@ enum vb2_io_modes {
+  */
+ enum vb2_buffer_state {
+ 	VB2_BUF_STATE_DEQUEUED,
++	VB2_BUF_STATE_IN_REQUEST,
+ 	VB2_BUF_STATE_PREPARING,
+ 	VB2_BUF_STATE_QUEUED,
+ 	VB2_BUF_STATE_REQUEUEING,
+@@ -293,6 +295,7 @@ struct vb2_buffer {
+ 	u32		cnt_buf_finish;
+ 	u32		cnt_buf_cleanup;
+ 	u32		cnt_buf_queue;
++	u32		cnt_buf_request_complete;
+ 
+ 	/* This counts the number of calls to vb2_buffer_done() */
+ 	u32		cnt_buf_done;
+@@ -386,6 +389,11 @@ struct vb2_buffer {
+  *			ioctl; might be called before @start_streaming callback
+  *			if user pre-queued buffers before calling
+  *			VIDIOC_STREAMON().
++ * @buf_request_complete: a buffer that was never queued to the driver but is
++ *			associated with a queued request was canceled.
++ *			The driver will have to mark associated objects in the
++ *			request as completed; required if requests are
++ *			supported.
+  */
+ struct vb2_ops {
+ 	int (*queue_setup)(struct vb2_queue *q,
+@@ -404,6 +412,8 @@ struct vb2_ops {
+ 	void (*stop_streaming)(struct vb2_queue *q);
+ 
+ 	void (*buf_queue)(struct vb2_buffer *vb);
++
++	void (*buf_request_complete)(struct vb2_buffer *vb);
+ };
+ 
+ /**
+@@ -761,12 +771,17 @@ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb);
+  * @index:	id number of the buffer
+  * @pb:		buffer structure passed from userspace to
+  *		v4l2_ioctl_ops->vidioc_qbuf handler in driver
++ * @req:	pointer to &struct media_request, may be NULL.
+  *
+  * Videobuf2 core helper to implement VIDIOC_QBUF() operation. It is called
+  * internally by VB2 by an API-specific handler, like ``videobuf2-v4l2.h``.
+  *
+  * This function:
+  *
++ * #) If @req is non-NULL, then the buffer will be bound to this
++ *    media request and it returns. The buffer will be prepared and
++ *    queued to the driver (i.e. the next two steps) when the request
++ *    itself is queued.
+  * #) if necessary, calls &vb2_ops->buf_prepare callback in the driver
+  *    (if provided), in which driver-specific buffer initialization can
+  *    be performed;
+@@ -775,7 +790,8 @@ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb);
+  *
+  * Return: returns zero on success; an error code otherwise.
+  */
+-int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb);
++int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
++		  struct media_request *req);
+ 
+ /**
+  * vb2_core_dqbuf() - Dequeue a buffer to the userspace
+-- 
+2.18.0
+
+From ce7d16f8a39b53a34037e9200c77eb524577a17c Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Wed, 30 May 2018 08:46:22 +0200
+Subject: [PATCH 23/34] videobuf2-v4l2: integrate with media requests
+
+This implements the V4L2 part of the request support. The main
+change is that vb2_qbuf and vb2_prepare_buf now have a new
+media_device pointer. This required changes to several drivers
+that did not use the vb2_ioctl_qbuf/prepare_buf helper functions.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-core.c   |  13 +-
+ .../media/common/videobuf2/videobuf2-v4l2.c   | 112 ++++++++++++++++--
+ drivers/media/platform/omap3isp/ispvideo.c    |   2 +-
+ .../media/platform/s3c-camif/camif-capture.c  |   4 +-
+ drivers/media/platform/s5p-mfc/s5p_mfc_dec.c  |   4 +-
+ drivers/media/platform/s5p-mfc/s5p_mfc_enc.c  |   4 +-
+ .../media/platform/soc_camera/soc_camera.c    |   4 +-
+ drivers/media/usb/uvc/uvc_queue.c             |   5 +-
+ drivers/media/usb/uvc/uvc_v4l2.c              |   3 +-
+ drivers/media/usb/uvc/uvcvideo.h              |   1 +
+ drivers/media/v4l2-core/v4l2-mem2mem.c        |   6 +-
+ .../staging/media/davinci_vpfe/vpfe_video.c   |   3 +-
+ drivers/staging/media/omap4iss/iss_video.c    |   3 +-
+ drivers/usb/gadget/function/uvc_queue.c       |   2 +-
+ include/media/videobuf2-v4l2.h                |  14 ++-
+ 15 files changed, 148 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index 6d423bc5a1a1..049822bcdd02 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -1338,6 +1338,14 @@ static void vb2_req_queue(struct media_request_object *obj)
+ 	mutex_unlock(vb->vb2_queue->lock);
+ }
+ 
++static void vb2_req_unbind(struct media_request_object *obj)
++{
++	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
++
++	if (vb->state == VB2_BUF_STATE_IN_REQUEST)
++		call_void_bufop(vb->vb2_queue, init_buffer, vb);
++}
++
+ static void vb2_req_release(struct media_request_object *obj)
+ {
+ 	struct vb2_buffer *vb = container_of(obj, struct vb2_buffer, req_obj);
+@@ -1350,6 +1358,7 @@ static const struct media_request_object_ops vb2_core_req_ops = {
+ 	.prepare = vb2_req_prepare,
+ 	.unprepare = vb2_req_unprepare,
+ 	.queue = vb2_req_queue,
++	.unbind = vb2_req_unbind,
+ 	.release = vb2_req_release,
+ };
+ 
+@@ -1476,8 +1485,10 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
+ 
+ 		vb->state = VB2_BUF_STATE_IN_REQUEST;
+ 		/* Fill buffer information for the userspace */
+-		if (pb)
++		if (pb) {
++			call_void_bufop(q, copy_timestamp, vb, pb);
+ 			call_void_bufop(q, fill_user_buffer, vb, pb);
++		}
+ 
+ 		dprintk(2, "qbuf of buffer %d succeeded\n", vb->index);
+ 		return 0;
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index ea9db4b3f59a..9c652afa62ab 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -25,6 +25,7 @@
+ #include <linux/kthread.h>
+ 
+ #include <media/v4l2-dev.h>
++#include <media/v4l2-device.h>
+ #include <media/v4l2-fh.h>
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-common.h>
+@@ -40,10 +41,12 @@ module_param(debug, int, 0644);
+ 			pr_info("vb2-v4l2: %s: " fmt, __func__, ## arg); \
+ 	} while (0)
+ 
+-/* Flags that are set by the vb2 core */
++/* Flags that are set by us */
+ #define V4L2_BUFFER_MASK_FLAGS	(V4L2_BUF_FLAG_MAPPED | V4L2_BUF_FLAG_QUEUED | \
+ 				 V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_ERROR | \
+ 				 V4L2_BUF_FLAG_PREPARED | \
++				 V4L2_BUF_FLAG_IN_REQUEST | \
++				 V4L2_BUF_FLAG_REQUEST_FD | \
+ 				 V4L2_BUF_FLAG_TIMESTAMP_MASK)
+ /* Output buffer flags that should be passed on to the driver */
+ #define V4L2_BUFFER_OUT_FLAGS	(V4L2_BUF_FLAG_PFRAME | V4L2_BUF_FLAG_BFRAME | \
+@@ -118,6 +121,16 @@ static int __verify_length(struct vb2_buffer *vb, const struct v4l2_buffer *b)
+ 	return 0;
+ }
+ 
++/*
++ * __init_v4l2_vb2_buffer() - initialize the v4l2_vb2_buffer struct
++ */
++static void __init_v4l2_vb2_buffer(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	vbuf->request_fd = -1;
++}
++
+ static void __copy_timestamp(struct vb2_buffer *vb, const void *pb)
+ {
+ 	const struct v4l2_buffer *b = pb;
+@@ -181,6 +194,7 @@ static int vb2_fill_vb2_v4l2_buffer(struct vb2_buffer *vb, struct v4l2_buffer *b
+ 		return -EINVAL;
+ 	}
+ 	vbuf->sequence = 0;
++	vbuf->request_fd = -1;
+ 
+ 	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+ 		switch (b->memory) {
+@@ -318,9 +332,12 @@ static int vb2_fill_vb2_v4l2_buffer(struct vb2_buffer *vb, struct v4l2_buffer *b
+ 	return 0;
+ }
+ 
+-static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+-				    const char *opname)
++static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct media_device *mdev,
++				    struct v4l2_buffer *b,
++				    const char *opname,
++				    struct media_request **p_req)
+ {
++	struct media_request *req;
+ 	struct vb2_v4l2_buffer *vbuf;
+ 	struct vb2_buffer *vb;
+ 	int ret;
+@@ -357,8 +374,60 @@ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b,
+ 		memset(vbuf->planes, 0,
+ 		       sizeof(vbuf->planes[0]) * vb->num_planes);
+ 		ret = vb2_fill_vb2_v4l2_buffer(vb, b);
++		if (ret)
++			return ret;
+ 	}
+-	return ret;
++
++	if (!(b->flags & V4L2_BUF_FLAG_REQUEST_FD))
++		return 0;
++
++	/*
++	 * For proper locking when queueing a request you need to be able
++	 * to lock access to the vb2 queue, so check that there is a lock
++	 * that we can use. In addition p_req must be non-NULL.
++	 */
++	if (WARN_ON(!q->lock || !p_req))
++		return -EINVAL;
++
++	/*
++	 * Make sure this op is implemented by the driver. It's easy to forget
++	 * this callback, but is it important when canceling a buffer in a
++	 * queued request.
++	 */
++	if (WARN_ON(!q->ops->buf_request_complete))
++		return -EINVAL;
++
++	if (vb->state != VB2_BUF_STATE_DEQUEUED) {
++		dprintk(1, "%s: buffer is not in dequeued state\n", opname);
++		return -EINVAL;
++	}
++
++	if (b->request_fd < 0) {
++		dprintk(1, "%s: request_fd < 0\n", opname);
++		return -EINVAL;
++	}
++
++	req = media_request_get_by_fd(mdev, b->request_fd);
++	if (IS_ERR(req)) {
++		dprintk(1, "%s: invalid request_fd\n", opname);
++		return PTR_ERR(req);
++	}
++
++	/*
++	 * Early sanity check. This is checked again when the buffer
++	 * is bound to the request in vb2_core_qbuf().
++	 */
++	if (req->state != MEDIA_REQUEST_STATE_IDLE &&
++	    req->state != MEDIA_REQUEST_STATE_UPDATING) {
++		dprintk(1, "%s: request is not idle\n", opname);
++		media_request_put(req);
++		return -EBUSY;
++	}
++
++	*p_req = req;
++	vbuf->request_fd = b->request_fd;
++
++	return 0;
+ }
+ 
+ /*
+@@ -442,6 +511,7 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 		b->flags |= V4L2_BUF_FLAG_QUEUED;
+ 		break;
+ 	case VB2_BUF_STATE_IN_REQUEST:
++		b->flags |= V4L2_BUF_FLAG_IN_REQUEST;
+ 		break;
+ 	case VB2_BUF_STATE_ERROR:
+ 		b->flags |= V4L2_BUF_FLAG_ERROR;
+@@ -456,11 +526,17 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, void *pb)
+ 		break;
+ 	}
+ 
+-	if (vb->state == VB2_BUF_STATE_DEQUEUED && vb->synced && vb->prepared)
++	if ((vb->state == VB2_BUF_STATE_DEQUEUED ||
++	     vb->state == VB2_BUF_STATE_IN_REQUEST) &&
++	    vb->synced && vb->prepared)
+ 		b->flags |= V4L2_BUF_FLAG_PREPARED;
+ 
+ 	if (vb2_buffer_in_use(q, vb))
+ 		b->flags |= V4L2_BUF_FLAG_MAPPED;
++	if (vbuf->request_fd >= 0) {
++		b->flags |= V4L2_BUF_FLAG_REQUEST_FD;
++		b->request_fd = vbuf->request_fd;
++	}
+ 
+ 	if (!q->is_output &&
+ 		b->flags & V4L2_BUF_FLAG_DONE &&
+@@ -494,6 +570,7 @@ static int __fill_vb2_buffer(struct vb2_buffer *vb, struct vb2_plane *planes)
+ 
+ static const struct vb2_buf_ops v4l2_buf_ops = {
+ 	.verify_planes_array	= __verify_planes_array_core,
++	.init_buffer		= __init_v4l2_vb2_buffer,
+ 	.fill_user_buffer	= __fill_v4l2_buffer,
+ 	.fill_vb2_buffer	= __fill_vb2_buffer,
+ 	.copy_timestamp		= __copy_timestamp,
+@@ -542,7 +619,8 @@ int vb2_reqbufs(struct vb2_queue *q, struct v4l2_requestbuffers *req)
+ }
+ EXPORT_SYMBOL_GPL(vb2_reqbufs);
+ 
+-int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b)
++int vb2_prepare_buf(struct vb2_queue *q, struct media_device *mdev,
++		    struct v4l2_buffer *b)
+ {
+ 	int ret;
+ 
+@@ -551,7 +629,10 @@ int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b)
+ 		return -EBUSY;
+ 	}
+ 
+-	ret = vb2_queue_or_prepare_buf(q, b, "prepare_buf");
++	if (b->flags & V4L2_BUF_FLAG_REQUEST_FD)
++		return -EINVAL;
++
++	ret = vb2_queue_or_prepare_buf(q, mdev, b, "prepare_buf", NULL);
+ 
+ 	return ret ? ret : vb2_core_prepare_buf(q, b->index, b);
+ }
+@@ -611,8 +692,10 @@ int vb2_create_bufs(struct vb2_queue *q, struct v4l2_create_buffers *create)
+ }
+ EXPORT_SYMBOL_GPL(vb2_create_bufs);
+ 
+-int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b)
++int vb2_qbuf(struct vb2_queue *q, struct media_device *mdev,
++	     struct v4l2_buffer *b)
+ {
++	struct media_request *req = NULL;
+ 	int ret;
+ 
+ 	if (vb2_fileio_is_active(q)) {
+@@ -620,8 +703,13 @@ int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b)
+ 		return -EBUSY;
+ 	}
+ 
+-	ret = vb2_queue_or_prepare_buf(q, b, "qbuf");
+-	return ret ? ret : vb2_core_qbuf(q, b->index, b, NULL);
++	ret = vb2_queue_or_prepare_buf(q, mdev, b, "qbuf", &req);
++	if (ret)
++		return ret;
++	ret = vb2_core_qbuf(q, b->index, b, req);
++	if (req)
++		media_request_put(req);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(vb2_qbuf);
+ 
+@@ -811,7 +899,7 @@ int vb2_ioctl_prepare_buf(struct file *file, void *priv,
+ 
+ 	if (vb2_queue_is_busy(vdev, file))
+ 		return -EBUSY;
+-	return vb2_prepare_buf(vdev->queue, p);
++	return vb2_prepare_buf(vdev->queue, vdev->v4l2_dev->mdev, p);
+ }
+ EXPORT_SYMBOL_GPL(vb2_ioctl_prepare_buf);
+ 
+@@ -830,7 +918,7 @@ int vb2_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
+ 
+ 	if (vb2_queue_is_busy(vdev, file))
+ 		return -EBUSY;
+-	return vb2_qbuf(vdev->queue, p);
++	return vb2_qbuf(vdev->queue, vdev->v4l2_dev->mdev, p);
+ }
+ EXPORT_SYMBOL_GPL(vb2_ioctl_qbuf);
+ 
+diff --git a/drivers/media/platform/omap3isp/ispvideo.c b/drivers/media/platform/omap3isp/ispvideo.c
+index 674e7fd3ad99..1de7b6b13f67 100644
+--- a/drivers/media/platform/omap3isp/ispvideo.c
++++ b/drivers/media/platform/omap3isp/ispvideo.c
+@@ -940,7 +940,7 @@ isp_video_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
+ 	int ret;
+ 
+ 	mutex_lock(&video->queue_lock);
+-	ret = vb2_qbuf(&vfh->queue, b);
++	ret = vb2_qbuf(&vfh->queue, video->video.v4l2_dev->mdev, b);
+ 	mutex_unlock(&video->queue_lock);
+ 
+ 	return ret;
+diff --git a/drivers/media/platform/s3c-camif/camif-capture.c b/drivers/media/platform/s3c-camif/camif-capture.c
+index b1d9f3857d3d..60b62ec6e9cd 100644
+--- a/drivers/media/platform/s3c-camif/camif-capture.c
++++ b/drivers/media/platform/s3c-camif/camif-capture.c
+@@ -943,7 +943,7 @@ static int s3c_camif_qbuf(struct file *file, void *priv,
+ 	if (vp->owner && vp->owner != priv)
+ 		return -EBUSY;
+ 
+-	return vb2_qbuf(&vp->vb_queue, buf);
++	return vb2_qbuf(&vp->vb_queue, vp->vdev.v4l2_dev->mdev, buf);
+ }
+ 
+ static int s3c_camif_dqbuf(struct file *file, void *priv,
+@@ -981,7 +981,7 @@ static int s3c_camif_prepare_buf(struct file *file, void *priv,
+ 				 struct v4l2_buffer *b)
+ {
+ 	struct camif_vp *vp = video_drvdata(file);
+-	return vb2_prepare_buf(&vp->vb_queue, b);
++	return vb2_prepare_buf(&vp->vb_queue, vp->vdev.v4l2_dev->mdev, b);
+ }
+ 
+ static int s3c_camif_g_selection(struct file *file, void *priv,
+diff --git a/drivers/media/platform/s5p-mfc/s5p_mfc_dec.c b/drivers/media/platform/s5p-mfc/s5p_mfc_dec.c
+index 6a3cc4f86c5d..fc0b61f1b91d 100644
+--- a/drivers/media/platform/s5p-mfc/s5p_mfc_dec.c
++++ b/drivers/media/platform/s5p-mfc/s5p_mfc_dec.c
+@@ -632,9 +632,9 @@ static int vidioc_qbuf(struct file *file, void *priv, struct v4l2_buffer *buf)
+ 		return -EIO;
+ 	}
+ 	if (buf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+-		return vb2_qbuf(&ctx->vq_src, buf);
++		return vb2_qbuf(&ctx->vq_src, NULL, buf);
+ 	else if (buf->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+-		return vb2_qbuf(&ctx->vq_dst, buf);
++		return vb2_qbuf(&ctx->vq_dst, NULL, buf);
+ 	return -EINVAL;
+ }
+ 
+diff --git a/drivers/media/platform/s5p-mfc/s5p_mfc_enc.c b/drivers/media/platform/s5p-mfc/s5p_mfc_enc.c
+index 3ad4f5073002..9208c83aa377 100644
+--- a/drivers/media/platform/s5p-mfc/s5p_mfc_enc.c
++++ b/drivers/media/platform/s5p-mfc/s5p_mfc_enc.c
+@@ -1621,9 +1621,9 @@ static int vidioc_qbuf(struct file *file, void *priv, struct v4l2_buffer *buf)
+ 			mfc_err("Call on QBUF after EOS command\n");
+ 			return -EIO;
+ 		}
+-		return vb2_qbuf(&ctx->vq_src, buf);
++		return vb2_qbuf(&ctx->vq_src, NULL, buf);
+ 	} else if (buf->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+-		return vb2_qbuf(&ctx->vq_dst, buf);
++		return vb2_qbuf(&ctx->vq_dst, NULL, buf);
+ 	}
+ 	return -EINVAL;
+ }
+diff --git a/drivers/media/platform/soc_camera/soc_camera.c b/drivers/media/platform/soc_camera/soc_camera.c
+index 901c07f49351..4572fea38d0b 100644
+--- a/drivers/media/platform/soc_camera/soc_camera.c
++++ b/drivers/media/platform/soc_camera/soc_camera.c
+@@ -394,7 +394,7 @@ static int soc_camera_qbuf(struct file *file, void *priv,
+ 	if (icd->streamer != file)
+ 		return -EBUSY;
+ 
+-	return vb2_qbuf(&icd->vb2_vidq, p);
++	return vb2_qbuf(&icd->vb2_vidq, NULL, p);
+ }
+ 
+ static int soc_camera_dqbuf(struct file *file, void *priv,
+@@ -430,7 +430,7 @@ static int soc_camera_prepare_buf(struct file *file, void *priv,
+ {
+ 	struct soc_camera_device *icd = file->private_data;
+ 
+-	return vb2_prepare_buf(&icd->vb2_vidq, b);
++	return vb2_prepare_buf(&icd->vb2_vidq, NULL, b);
+ }
+ 
+ static int soc_camera_expbuf(struct file *file, void *priv,
+diff --git a/drivers/media/usb/uvc/uvc_queue.c b/drivers/media/usb/uvc/uvc_queue.c
+index fecccb5e7628..8964e16f2b22 100644
+--- a/drivers/media/usb/uvc/uvc_queue.c
++++ b/drivers/media/usb/uvc/uvc_queue.c
+@@ -300,12 +300,13 @@ int uvc_create_buffers(struct uvc_video_queue *queue,
+ 	return ret;
+ }
+ 
+-int uvc_queue_buffer(struct uvc_video_queue *queue, struct v4l2_buffer *buf)
++int uvc_queue_buffer(struct uvc_video_queue *queue,
++		     struct media_device *mdev, struct v4l2_buffer *buf)
+ {
+ 	int ret;
+ 
+ 	mutex_lock(&queue->mutex);
+-	ret = vb2_qbuf(&queue->queue, buf);
++	ret = vb2_qbuf(&queue->queue, mdev, buf);
+ 	mutex_unlock(&queue->mutex);
+ 
+ 	return ret;
+diff --git a/drivers/media/usb/uvc/uvc_v4l2.c b/drivers/media/usb/uvc/uvc_v4l2.c
+index bd32914259ae..3da5fdc002ac 100644
+--- a/drivers/media/usb/uvc/uvc_v4l2.c
++++ b/drivers/media/usb/uvc/uvc_v4l2.c
+@@ -751,7 +751,8 @@ static int uvc_ioctl_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
+ 	if (!uvc_has_privileges(handle))
+ 		return -EBUSY;
+ 
+-	return uvc_queue_buffer(&stream->queue, buf);
++	return uvc_queue_buffer(&stream->queue,
++				stream->vdev.v4l2_dev->mdev, buf);
+ }
+ 
+ static int uvc_ioctl_expbuf(struct file *file, void *fh,
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index be5cf179228b..bc9ed18f043c 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -680,6 +680,7 @@ int uvc_query_buffer(struct uvc_video_queue *queue,
+ int uvc_create_buffers(struct uvc_video_queue *queue,
+ 		       struct v4l2_create_buffers *v4l2_cb);
+ int uvc_queue_buffer(struct uvc_video_queue *queue,
++		     struct media_device *mdev,
+ 		     struct v4l2_buffer *v4l2_buf);
+ int uvc_export_buffer(struct uvc_video_queue *queue,
+ 		      struct v4l2_exportbuffer *exp);
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index 725da74d15d8..9bfe1c456046 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -409,11 +409,12 @@ EXPORT_SYMBOL_GPL(v4l2_m2m_querybuf);
+ int v4l2_m2m_qbuf(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ 		  struct v4l2_buffer *buf)
+ {
++	struct video_device *vdev = video_devdata(file);
+ 	struct vb2_queue *vq;
+ 	int ret;
+ 
+ 	vq = v4l2_m2m_get_vq(m2m_ctx, buf->type);
+-	ret = vb2_qbuf(vq, buf);
++	ret = vb2_qbuf(vq, vdev->v4l2_dev->mdev, buf);
+ 	if (!ret)
+ 		v4l2_m2m_try_schedule(m2m_ctx);
+ 
+@@ -434,11 +435,12 @@ EXPORT_SYMBOL_GPL(v4l2_m2m_dqbuf);
+ int v4l2_m2m_prepare_buf(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ 			 struct v4l2_buffer *buf)
+ {
++	struct video_device *vdev = video_devdata(file);
+ 	struct vb2_queue *vq;
+ 	int ret;
+ 
+ 	vq = v4l2_m2m_get_vq(m2m_ctx, buf->type);
+-	ret = vb2_prepare_buf(vq, buf);
++	ret = vb2_prepare_buf(vq, vdev->v4l2_dev->mdev, buf);
+ 	if (!ret)
+ 		v4l2_m2m_try_schedule(m2m_ctx);
+ 
+diff --git a/drivers/staging/media/davinci_vpfe/vpfe_video.c b/drivers/staging/media/davinci_vpfe/vpfe_video.c
+index 4e3ec7fdc90d..6d693067a251 100644
+--- a/drivers/staging/media/davinci_vpfe/vpfe_video.c
++++ b/drivers/staging/media/davinci_vpfe/vpfe_video.c
+@@ -1425,7 +1425,8 @@ static int vpfe_qbuf(struct file *file, void *priv,
+ 		return -EACCES;
+ 	}
+ 
+-	return vb2_qbuf(&video->buffer_queue, p);
++	return vb2_qbuf(&video->buffer_queue,
++			video->video_dev.v4l2_dev->mdev, p);
+ }
+ 
+ /*
+diff --git a/drivers/staging/media/omap4iss/iss_video.c b/drivers/staging/media/omap4iss/iss_video.c
+index a3a83424a926..a35d1004b522 100644
+--- a/drivers/staging/media/omap4iss/iss_video.c
++++ b/drivers/staging/media/omap4iss/iss_video.c
+@@ -805,9 +805,10 @@ iss_video_querybuf(struct file *file, void *fh, struct v4l2_buffer *b)
+ static int
+ iss_video_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
+ {
++	struct iss_video *video = video_drvdata(file);
+ 	struct iss_video_fh *vfh = to_iss_video_fh(fh);
+ 
+-	return vb2_qbuf(&vfh->queue, b);
++	return vb2_qbuf(&vfh->queue, video->video.v4l2_dev->mdev, b);
+ }
+ 
+ static int
+diff --git a/drivers/usb/gadget/function/uvc_queue.c b/drivers/usb/gadget/function/uvc_queue.c
+index 9e33d5206d54..f2497cb96abb 100644
+--- a/drivers/usb/gadget/function/uvc_queue.c
++++ b/drivers/usb/gadget/function/uvc_queue.c
+@@ -166,7 +166,7 @@ int uvcg_queue_buffer(struct uvc_video_queue *queue, struct v4l2_buffer *buf)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	ret = vb2_qbuf(&queue->queue, buf);
++	ret = vb2_qbuf(&queue->queue, NULL, buf);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/include/media/videobuf2-v4l2.h b/include/media/videobuf2-v4l2.h
+index 097bf3e6951d..91a2b3e1a642 100644
+--- a/include/media/videobuf2-v4l2.h
++++ b/include/media/videobuf2-v4l2.h
+@@ -32,6 +32,7 @@
+  *		&enum v4l2_field.
+  * @timecode:	frame timecode.
+  * @sequence:	sequence count of this frame.
++ * @request_fd:	the request_fd associated with this buffer
+  * @planes:	plane information (userptr/fd, length, bytesused, data_offset).
+  *
+  * Should contain enough information to be able to cover all the fields
+@@ -44,6 +45,7 @@ struct vb2_v4l2_buffer {
+ 	__u32			field;
+ 	struct v4l2_timecode	timecode;
+ 	__u32			sequence;
++	__s32			request_fd;
+ 	struct vb2_plane	planes[VB2_MAX_PLANES];
+ };
+ 
+@@ -79,6 +81,7 @@ int vb2_create_bufs(struct vb2_queue *q, struct v4l2_create_buffers *create);
+  * vb2_prepare_buf() - Pass ownership of a buffer from userspace to the kernel
+  *
+  * @q:		pointer to &struct vb2_queue with videobuf2 queue.
++ * @mdev:	pointer to &struct media_device, may be NULL.
+  * @b:		buffer structure passed from userspace to
+  *		&v4l2_ioctl_ops->vidioc_prepare_buf handler in driver
+  *
+@@ -90,15 +93,19 @@ int vb2_create_bufs(struct vb2_queue *q, struct v4l2_create_buffers *create);
+  * #) verifies the passed buffer,
+  * #) calls &vb2_ops->buf_prepare callback in the driver (if provided),
+  *    in which driver-specific buffer initialization can be performed.
++ * #) if @b->request_fd is non-zero and @mdev->ops->req_queue is set,
++ *    then bind the prepared buffer to the request.
+  *
+  * The return values from this function are intended to be directly returned
+  * from &v4l2_ioctl_ops->vidioc_prepare_buf handler in driver.
+  */
+-int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b);
++int vb2_prepare_buf(struct vb2_queue *q, struct media_device *mdev,
++		    struct v4l2_buffer *b);
+ 
+ /**
+  * vb2_qbuf() - Queue a buffer from userspace
+  * @q:		pointer to &struct vb2_queue with videobuf2 queue.
++ * @mdev:	pointer to &struct media_device, may be NULL.
+  * @b:		buffer structure passed from userspace to
+  *		&v4l2_ioctl_ops->vidioc_qbuf handler in driver
+  *
+@@ -107,6 +114,8 @@ int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b);
+  * This function:
+  *
+  * #) verifies the passed buffer;
++ * #) if @b->request_fd is non-zero and @mdev->ops->req_queue is set,
++ *    then bind the buffer to the request.
+  * #) if necessary, calls &vb2_ops->buf_prepare callback in the driver
+  *    (if provided), in which driver-specific buffer initialization can
+  *    be performed;
+@@ -116,7 +125,8 @@ int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b);
+  * The return values from this function are intended to be directly returned
+  * from &v4l2_ioctl_ops->vidioc_qbuf handler in driver.
+  */
+-int vb2_qbuf(struct vb2_queue *q, struct v4l2_buffer *b);
++int vb2_qbuf(struct vb2_queue *q, struct media_device *mdev,
++	     struct v4l2_buffer *b);
+ 
+ /**
+  * vb2_expbuf() - Export a buffer as a file descriptor
+-- 
+2.18.0
+
+From ca6928e88908549fca1ddedb550cda39446c9d57 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:51 +0300
+Subject: [PATCH 24/34] videobuf2-core: add request helper functions
+
+Add a new helper function to tell if a request object is a buffer.
+
+Add a new helper function that returns true if a media_request
+contains at least one buffer.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-core.c   | 24 +++++++++++++++++++
+ include/media/videobuf2-core.h                | 15 ++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index 049822bcdd02..166175a34e7f 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -1362,6 +1362,30 @@ static const struct media_request_object_ops vb2_core_req_ops = {
+ 	.release = vb2_req_release,
+ };
+ 
++bool vb2_request_object_is_buffer(struct media_request_object *obj)
++{
++	return obj->ops == &vb2_core_req_ops;
++}
++EXPORT_SYMBOL_GPL(vb2_request_object_is_buffer);
++
++bool vb2_request_has_buffers(struct media_request *req)
++{
++	struct media_request_object *obj;
++	unsigned long flags;
++	bool has_buffers = false;
++
++	spin_lock_irqsave(&req->lock, flags);
++	list_for_each_entry(obj, &req->objects, list) {
++		if (vb2_request_object_is_buffer(obj)) {
++			has_buffers = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&req->lock, flags);
++	return has_buffers;
++}
++EXPORT_SYMBOL_GPL(vb2_request_has_buffers);
++
+ int vb2_core_prepare_buf(struct vb2_queue *q, unsigned int index, void *pb)
+ {
+ 	struct vb2_buffer *vb;
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index 8a8d7732d182..cad712403d14 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -1168,4 +1168,19 @@ bool vb2_buffer_in_use(struct vb2_queue *q, struct vb2_buffer *vb);
+  */
+ int vb2_verify_memory_type(struct vb2_queue *q,
+ 		enum vb2_memory memory, unsigned int type);
++
++/**
++ * vb2_request_object_is_buffer() - return true if the object is a buffer
++ *
++ * @obj:	the request object.
++ */
++bool vb2_request_object_is_buffer(struct media_request_object *obj);
++
++/**
++ * vb2_request_has_buffers() - return true if the request contains buffers
++ *
++ * @req:	the request.
++ */
++bool vb2_request_has_buffers(struct media_request *req);
++
+ #endif /* _MEDIA_VIDEOBUF2_CORE_H */
+-- 
+2.18.0
+
+From df3223c6fd8575802ec1b562b1f5522e33d35810 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:52 +0300
+Subject: [PATCH 25/34] videobuf2-v4l2: add vb2_request_queue/validate helpers
+
+The generic vb2_request_validate helper function checks if
+there are buffers in the request and if so, prepares (validates)
+all objects in the request.
+
+The generic vb2_request_queue helper function queues all buffer
+objects in the validated request.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ .../media/common/videobuf2/videobuf2-v4l2.c   | 44 +++++++++++++++++++
+ include/media/videobuf2-v4l2.h                |  4 ++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index 9c652afa62ab..88d8f60c742b 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -1100,6 +1100,50 @@ void vb2_ops_wait_finish(struct vb2_queue *vq)
+ }
+ EXPORT_SYMBOL_GPL(vb2_ops_wait_finish);
+ 
++int vb2_request_validate(struct media_request *req)
++{
++	struct media_request_object *obj;
++	int ret = 0;
++
++	if (!vb2_request_has_buffers(req))
++		return -ENOENT;
++
++	list_for_each_entry(obj, &req->objects, list) {
++		if (!obj->ops->prepare)
++			continue;
++
++		ret = obj->ops->prepare(obj);
++		if (ret)
++			break;
++	}
++
++	if (ret) {
++		list_for_each_entry_continue_reverse(obj, &req->objects, list)
++			if (obj->ops->unprepare)
++				obj->ops->unprepare(obj);
++		return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(vb2_request_validate);
++
++void vb2_request_queue(struct media_request *req)
++{
++	struct media_request_object *obj, *obj_safe;
++
++	/* Queue all non-buffer objects */
++	list_for_each_entry_safe(obj, obj_safe, &req->objects, list)
++		if (obj->ops->queue && !vb2_request_object_is_buffer(obj))
++			obj->ops->queue(obj);
++
++	/* Queue all buffer objects */
++	list_for_each_entry_safe(obj, obj_safe, &req->objects, list) {
++		if (obj->ops->queue && vb2_request_object_is_buffer(obj))
++			obj->ops->queue(obj);
++	}
++}
++EXPORT_SYMBOL_GPL(vb2_request_queue);
++
+ MODULE_DESCRIPTION("Driver helper framework for Video for Linux 2");
+ MODULE_AUTHOR("Pawel Osciak <pawel@osciak.com>, Marek Szyprowski");
+ MODULE_LICENSE("GPL");
+diff --git a/include/media/videobuf2-v4l2.h b/include/media/videobuf2-v4l2.h
+index 91a2b3e1a642..727855463838 100644
+--- a/include/media/videobuf2-v4l2.h
++++ b/include/media/videobuf2-v4l2.h
+@@ -303,4 +303,8 @@ void vb2_ops_wait_prepare(struct vb2_queue *vq);
+  */
+ void vb2_ops_wait_finish(struct vb2_queue *vq);
+ 
++struct media_request;
++int vb2_request_validate(struct media_request *req);
++void vb2_request_queue(struct media_request *req);
++
+ #endif /* _MEDIA_VIDEOBUF2_V4L2_H */
+-- 
+2.18.0
+
+From 1a194541eeedaf9dedc8162ad84818aeff8526cd Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Wed, 23 May 2018 13:51:25 +0200
+Subject: [PATCH 26/34] videobuf2-core: add uses_requests/qbuf flags
+
+Set the first time a buffer from a request is queued to vb2
+(uses_requests) or directly queued (uses_qbuf).
+Cleared when the queue is canceled.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/common/videobuf2/videobuf2-core.c | 13 +++++++++++++
+ include/media/videobuf2-core.h                  |  8 ++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index 166175a34e7f..d3501cd604cb 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -1486,9 +1486,17 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
+ 
+ 	vb = q->bufs[index];
+ 
++	if ((req && q->uses_qbuf) ||
++	    (!req && vb->state != VB2_BUF_STATE_IN_REQUEST &&
++	     q->uses_requests)) {
++		dprintk(1, "queue in wrong mode (qbuf vs requests)\n");
++		return -EPERM;
++	}
++
+ 	if (req) {
+ 		int ret;
+ 
++		q->uses_requests = 1;
+ 		if (vb->state != VB2_BUF_STATE_DEQUEUED) {
+ 			dprintk(1, "buffer %d not in dequeued state\n",
+ 				vb->index);
+@@ -1518,6 +1526,9 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
+ 		return 0;
+ 	}
+ 
++	if (vb->state != VB2_BUF_STATE_IN_REQUEST)
++		q->uses_qbuf = 1;
++
+ 	switch (vb->state) {
+ 	case VB2_BUF_STATE_DEQUEUED:
+ 	case VB2_BUF_STATE_IN_REQUEST:
+@@ -1820,6 +1831,8 @@ static void __vb2_queue_cancel(struct vb2_queue *q)
+ 	q->start_streaming_called = 0;
+ 	q->queued_count = 0;
+ 	q->error = 0;
++	q->uses_requests = 0;
++	q->uses_qbuf = 0;
+ 
+ 	/*
+ 	 * Remove all buffers from videobuf's list...
+diff --git a/include/media/videobuf2-core.h b/include/media/videobuf2-core.h
+index cad712403d14..daffdf259fce 100644
+--- a/include/media/videobuf2-core.h
++++ b/include/media/videobuf2-core.h
+@@ -468,6 +468,12 @@ struct vb2_buf_ops {
+  * @quirk_poll_must_check_waiting_for_buffers: Return %EPOLLERR at poll when QBUF
+  *              has not been called. This is a vb1 idiom that has been adopted
+  *              also by vb2.
++ * @uses_qbuf:	qbuf was used directly for this queue. Set to 1 the first
++ *		time this is called. Set to 0 when the queue is canceled.
++ *		If this is 1, then you cannot queue buffers from a request.
++ * @uses_requests: requests are used for this queue. Set to 1 the first time
++ *		a request is queued. Set to 0 when the queue is canceled.
++ *		If this is 1, then you cannot queue buffers directly.
+  * @lock:	pointer to a mutex that protects the &struct vb2_queue. The
+  *		driver can set this to a mutex to let the v4l2 core serialize
+  *		the queuing ioctls. If the driver wants to handle locking
+@@ -535,6 +541,8 @@ struct vb2_queue {
+ 	unsigned			fileio_write_immediately:1;
+ 	unsigned			allow_zero_bytesused:1;
+ 	unsigned		   quirk_poll_must_check_waiting_for_buffers:1;
++	unsigned			uses_qbuf:1;
++	unsigned			uses_requests:1;
+ 
+ 	struct mutex			*lock;
+ 	void				*owner;
+-- 
+2.18.0
+
+From c5343c7557d441c95190214d8af064fea35b43bd Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Wed, 23 May 2018 14:09:23 +0200
+Subject: [PATCH 27/34] videobuf2-v4l2: refuse qbuf if queue uses requests or
+ vv.
+
+Check if the vb2 queue uses requests, and if so refuse to
+add buffers that are not part of a request. Also check for
+the reverse: a vb2 queue did not use requests, and an attempt
+was made to queue a buffer to a request.
+
+We might relax this in the future, but for now just return
+-EPERM in that case.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/common/videobuf2/videobuf2-v4l2.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-v4l2.c b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+index 88d8f60c742b..1b2351986230 100644
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -378,8 +378,16 @@ static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct media_device *md
+ 			return ret;
+ 	}
+ 
+-	if (!(b->flags & V4L2_BUF_FLAG_REQUEST_FD))
++	if (!(b->flags & V4L2_BUF_FLAG_REQUEST_FD)) {
++		if (q->uses_requests) {
++			dprintk(1, "%s: queue uses requests\n", opname);
++			return -EPERM;
++		}
+ 		return 0;
++	} else if (q->uses_qbuf) {
++		dprintk(1, "%s: queue does not use requests\n", opname);
++		return -EPERM;
++	}
+ 
+ 	/*
+ 	 * For proper locking when queueing a request you need to be able
+-- 
+2.18.0
+
+From 36beea1c217abf1c78928b5cbda93c469f4d163a Mon Sep 17 00:00:00 2001
+From: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date: Mon, 21 May 2018 11:55:01 +0300
+Subject: [PATCH 28/34] v4l2-mem2mem: Simplify exiting the function in
+ v4l2_m2m_try_schedule
+
+The v4l2_m2m_try_schedule function acquires and releases multiple
+spinlocks; simplify unlocking the job lock by adding a label to unlock the
+job lock and exit the function.
+
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+---
+ drivers/media/v4l2-core/v4l2-mem2mem.c | 22 ++++++++++++----------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index 9bfe1c456046..114d50cf22c5 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -252,15 +252,13 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx)
+ 
+ 	/* If the context is aborted then don't schedule it */
+ 	if (m2m_ctx->job_flags & TRANS_ABORT) {
+-		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 		dprintk("Aborted context\n");
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	if (m2m_ctx->job_flags & TRANS_QUEUED) {
+-		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 		dprintk("On job queue already\n");
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	spin_lock_irqsave(&m2m_ctx->out_q_ctx.rdy_spinlock, flags_out);
+@@ -268,9 +266,8 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx)
+ 	    && !m2m_ctx->out_q_ctx.buffered) {
+ 		spin_unlock_irqrestore(&m2m_ctx->out_q_ctx.rdy_spinlock,
+ 					flags_out);
+-		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 		dprintk("No input buffers available\n");
+-		return;
++		goto out_unlock;
+ 	}
+ 	spin_lock_irqsave(&m2m_ctx->cap_q_ctx.rdy_spinlock, flags_cap);
+ 	if (list_empty(&m2m_ctx->cap_q_ctx.rdy_queue)
+@@ -279,18 +276,16 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx)
+ 					flags_cap);
+ 		spin_unlock_irqrestore(&m2m_ctx->out_q_ctx.rdy_spinlock,
+ 					flags_out);
+-		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 		dprintk("No output buffers available\n");
+-		return;
++		goto out_unlock;
+ 	}
+ 	spin_unlock_irqrestore(&m2m_ctx->cap_q_ctx.rdy_spinlock, flags_cap);
+ 	spin_unlock_irqrestore(&m2m_ctx->out_q_ctx.rdy_spinlock, flags_out);
+ 
+ 	if (m2m_dev->m2m_ops->job_ready
+ 		&& (!m2m_dev->m2m_ops->job_ready(m2m_ctx->priv))) {
+-		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 		dprintk("Driver not ready\n");
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	list_add_tail(&m2m_ctx->queue, &m2m_dev->job_queue);
+@@ -299,6 +294,13 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx)
+ 	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
+ 
+ 	v4l2_m2m_try_run(m2m_dev);
++
++	return;
++
++out_unlock:
++	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags_job);
++
++	return;
+ }
+ EXPORT_SYMBOL_GPL(v4l2_m2m_try_schedule);
+ 
+-- 
+2.18.0
+
+From baf11ccc63f074204f0be53c60ce945bb3536afb Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hans.verkuil@cisco.com>
+Date: Mon, 21 May 2018 11:54:53 +0300
+Subject: [PATCH 29/34] v4l2-mem2mem: add vb2_m2m_request_queue
+
+For mem2mem devices we have to make sure that v4l2_m2m_try_schedule()
+is called whenever a request is queued.
+
+We do that by creating a vb2_m2m_request_queue() helper that should
+be used instead of the 'normal' vb2_request_queue() helper. The m2m
+helper function will call v4l2_m2m_try_schedule() as needed.
+
+In addition we also avoid calling v4l2_m2m_try_schedule() when preparing
+or queueing a buffer for a request since that is no longer needed.
+Instead this helper function will do that when the request is actually
+queued.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+---
+ drivers/media/v4l2-core/v4l2-mem2mem.c | 59 ++++++++++++++++++++++----
+ include/media/v4l2-mem2mem.h           |  4 ++
+ 2 files changed, 55 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index 114d50cf22c5..79e1d5e8b371 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -325,7 +325,7 @@ static void v4l2_m2m_cancel_job(struct v4l2_m2m_ctx *m2m_ctx)
+ 	if (m2m_ctx->job_flags & TRANS_RUNNING) {
+ 		spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
+ 		m2m_dev->m2m_ops->job_abort(m2m_ctx->priv);
+-		dprintk("m2m_ctx %p running, will wait to complete", m2m_ctx);
++		dprintk("m2m_ctx %p running, will wait to complete\n", m2m_ctx);
+ 		wait_event(m2m_ctx->finished,
+ 				!(m2m_ctx->job_flags & TRANS_RUNNING));
+ 	} else if (m2m_ctx->job_flags & TRANS_QUEUED) {
+@@ -416,8 +416,14 @@ int v4l2_m2m_qbuf(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ 	int ret;
+ 
+ 	vq = v4l2_m2m_get_vq(m2m_ctx, buf->type);
++	if (!V4L2_TYPE_IS_OUTPUT(vq->type) &&
++	    (buf->flags & V4L2_BUF_FLAG_REQUEST_FD)) {
++		dprintk("%s: requests cannot be used with capture buffers\n",
++			__func__);
++		return -EPERM;
++	}
+ 	ret = vb2_qbuf(vq, vdev->v4l2_dev->mdev, buf);
+-	if (!ret)
++	if (!ret && !(buf->flags & V4L2_BUF_FLAG_IN_REQUEST))
+ 		v4l2_m2m_try_schedule(m2m_ctx);
+ 
+ 	return ret;
+@@ -439,14 +445,9 @@ int v4l2_m2m_prepare_buf(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ {
+ 	struct video_device *vdev = video_devdata(file);
+ 	struct vb2_queue *vq;
+-	int ret;
+ 
+ 	vq = v4l2_m2m_get_vq(m2m_ctx, buf->type);
+-	ret = vb2_prepare_buf(vq, vdev->v4l2_dev->mdev, buf);
+-	if (!ret)
+-		v4l2_m2m_try_schedule(m2m_ctx);
+-
+-	return ret;
++	return vb2_prepare_buf(vq, vdev->v4l2_dev->mdev, buf);
+ }
+ EXPORT_SYMBOL_GPL(v4l2_m2m_prepare_buf);
+ 
+@@ -891,6 +892,48 @@ void v4l2_m2m_buf_queue(struct v4l2_m2m_ctx *m2m_ctx,
+ }
+ EXPORT_SYMBOL_GPL(v4l2_m2m_buf_queue);
+ 
++void vb2_m2m_request_queue(struct media_request *req)
++{
++	struct media_request_object *obj, *obj_safe;
++	struct v4l2_m2m_ctx *m2m_ctx = NULL;
++
++	/* Queue all non-buffer objects */
++	list_for_each_entry_safe(obj, obj_safe, &req->objects, list)
++		if (obj->ops->queue && !vb2_request_object_is_buffer(obj))
++			obj->ops->queue(obj);
++
++	/* Queue all buffer objects */
++	list_for_each_entry_safe(obj, obj_safe, &req->objects, list) {
++		struct v4l2_m2m_ctx *m2m_ctx_obj;
++		struct vb2_buffer *vb;
++
++		if (!obj->ops->queue || !vb2_request_object_is_buffer(obj))
++			continue;
++
++		/* Sanity checks */
++		vb = container_of(obj, struct vb2_buffer, req_obj);
++		WARN_ON(!V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type));
++		m2m_ctx_obj = container_of(vb->vb2_queue,
++					   struct v4l2_m2m_ctx,
++					   out_q_ctx.q);
++		WARN_ON(m2m_ctx && m2m_ctx_obj != m2m_ctx);
++		m2m_ctx = m2m_ctx_obj;
++
++		/*
++		 * The buffer we queue here can in theory be immediately
++		 * unbound, hence the use of list_for_each_entry_safe()
++		 * above and why we call the queue op last.
++		 */
++		obj->ops->queue(obj);
++	}
++
++	WARN_ON(!m2m_ctx);
++
++	if (m2m_ctx)
++		v4l2_m2m_try_schedule(m2m_ctx);
++}
++EXPORT_SYMBOL_GPL(vb2_m2m_request_queue);
++
+ /* Videobuf2 ioctl helpers */
+ 
+ int v4l2_m2m_ioctl_reqbufs(struct file *file, void *priv,
+diff --git a/include/media/v4l2-mem2mem.h b/include/media/v4l2-mem2mem.h
+index af48b1eca025..2807e7c466ce 100644
+--- a/include/media/v4l2-mem2mem.h
++++ b/include/media/v4l2-mem2mem.h
+@@ -593,6 +593,10 @@ v4l2_m2m_dst_buf_remove_by_idx(struct v4l2_m2m_ctx *m2m_ctx, unsigned int idx)
+ 	return v4l2_m2m_buf_remove_by_idx(&m2m_ctx->cap_q_ctx, idx);
+ }
+ 
++/* v4l2 request helper */
++
++void vb2_m2m_request_queue(struct media_request *req);
++
+ /* v4l2 ioctl helpers */
+ 
+ int v4l2_m2m_ioctl_reqbufs(struct file *file, void *priv,
+-- 
+2.18.0
+

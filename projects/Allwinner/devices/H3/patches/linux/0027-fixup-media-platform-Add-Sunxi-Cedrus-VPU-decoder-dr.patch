@@ -1,0 +1,57 @@
+From 0e3f292197cc43451ffe5418531e88cecbcc6653 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 11 Jul 2018 14:59:57 +0200
+Subject: [PATCH 27/55] fixup! media: platform: Add Sunxi-Cedrus VPU decoder
+ driver
+
+---
+ drivers/media/platform/sunxi/cedrus/cedrus_video.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/cedrus/cedrus_video.c b/drivers/media/platform/sunxi/cedrus/cedrus_video.c
+index 0a9420b1c827..5e1444bfd2c9 100644
+--- a/drivers/media/platform/sunxi/cedrus/cedrus_video.c
++++ b/drivers/media/platform/sunxi/cedrus/cedrus_video.c
+@@ -165,9 +165,10 @@ static int cedrus_querycap(struct file *file, void *priv,
+ 
+ static int cedrus_enum_fmt(struct v4l2_fmtdesc *f, u32 direction)
+ {
+-	struct cedrus_format *fmt;
+ 	unsigned int i, index;
+ 
++	printk(KERN_ERR "%s: index %d\n", __func__, f->index);
++
+ 	/* Index among formats that match the requested direction. */
+ 	index = 0;
+ 
+@@ -182,8 +183,7 @@ static int cedrus_enum_fmt(struct v4l2_fmtdesc *f, u32 direction)
+ 
+ 	/* Matched format. */
+ 	if (i < CEDRUS_FORMATS_COUNT) {
+-		fmt = &cedrus_formats[i];
+-		f->pixelformat = fmt->pixelformat;
++		f->pixelformat = cedrus_formats[i].pixelformat;
+ 
+ 		return 0;
+ 	}
+@@ -198,7 +198,7 @@ static int cedrus_enum_fmt_vid_cap(struct file *file, void *priv,
+ }
+ 
+ static int cedrus_enum_fmt_vid_out(struct file *file, void *priv,
+-				   struct v4l2_fmtdesc *f)
++				  struct v4l2_fmtdesc *f)
+ {
+ 	return cedrus_enum_fmt(f, CEDRUS_DECODE_SRC);
+ }
+@@ -315,7 +315,7 @@ static int cedrus_s_fmt_vid_out(struct file *file, void *priv,
+ const struct v4l2_ioctl_ops cedrus_ioctl_ops = {
+ 	.vidioc_querycap		= cedrus_querycap,
+ 
+-	.vidioc_enum_fmt_vid_cap	= cedrus_enum_fmt_vid_cap,
++	.vidioc_enum_fmt_vid_cap_mplane	= cedrus_enum_fmt_vid_cap,
+ 	.vidioc_g_fmt_vid_cap_mplane	= cedrus_g_fmt_vid_cap,
+ 	.vidioc_try_fmt_vid_cap_mplane	= cedrus_try_fmt_vid_cap,
+ 	.vidioc_s_fmt_vid_cap_mplane	= cedrus_s_fmt_vid_cap,
+-- 
+2.18.0
+

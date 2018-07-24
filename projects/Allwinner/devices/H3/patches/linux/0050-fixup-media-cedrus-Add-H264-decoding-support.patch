@@ -1,0 +1,53 @@
+From 3e64b887ec426bf465303d3d735d6d3644650ccc Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Thu, 12 Jul 2018 17:05:09 +0200
+Subject: [PATCH 50/55] fixup! media: cedrus: Add H264 decoding support
+
+---
+ drivers/media/platform/sunxi/cedrus/cedrus.c     | 4 ++--
+ drivers/media/platform/sunxi/cedrus/cedrus_dec.c | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/cedrus/cedrus.c b/drivers/media/platform/sunxi/cedrus/cedrus.c
+index 1a931180941b..a218dd5f25a8 100644
+--- a/drivers/media/platform/sunxi/cedrus/cedrus.c
++++ b/drivers/media/platform/sunxi/cedrus/cedrus.c
+@@ -34,13 +34,13 @@ static const struct cedrus_control cedrus_controls[] = {
+ 		.required	= true,
+ 	},
+ 	{
+-		.id		= V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAM,
++		.id		= V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAMS,
+ 		.elem_size	= sizeof(struct v4l2_ctrl_h264_decode_param),
+ 		.codec		= CEDRUS_CODEC_H264,
+ 		.required	= true,
+ 	},
+ 	{
+-		.id		= V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAM,
++		.id		= V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAMS,
+ 		.elem_size	= sizeof(struct v4l2_ctrl_h264_slice_param),
+ 		.codec		= CEDRUS_CODEC_H264,
+ 		.required	= true,
+diff --git a/drivers/media/platform/sunxi/cedrus/cedrus_dec.c b/drivers/media/platform/sunxi/cedrus/cedrus_dec.c
+index c76d9260887d..732fe471e1dd 100644
+--- a/drivers/media/platform/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/media/platform/sunxi/cedrus/cedrus_dec.c
+@@ -62,13 +62,13 @@ void cedrus_device_run(void *priv)
+ 
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 		run.h264.decode_param = cedrus_find_control_data(ctx,
+-			V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAM);
++			V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAMS);
+ 		run.h264.pps = cedrus_find_control_data(ctx,
+ 			V4L2_CID_MPEG_VIDEO_H264_PPS);
+ 		run.h264.scaling_matrix = cedrus_find_control_data(ctx,
+ 			V4L2_CID_MPEG_VIDEO_H264_SCALING_MATRIX);
+ 		run.h264.slice_param = cedrus_find_control_data(ctx,
+-			V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAM);
++			V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAMS);
+ 		run.h264.scaling_matrix = cedrus_find_control_data(ctx,
+ 			V4L2_CID_MPEG_VIDEO_H264_SCALING_MATRIX);
+ 		run.h264.sps = cedrus_find_control_data(ctx,
+-- 
+2.18.0
+

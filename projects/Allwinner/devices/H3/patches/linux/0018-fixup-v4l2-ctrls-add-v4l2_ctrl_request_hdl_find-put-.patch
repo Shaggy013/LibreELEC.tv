@@ -1,0 +1,26 @@
+From bb8fce98e109cb47efdb6dc8df9993e28e2acb23 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Mon, 9 Jul 2018 15:43:22 +0200
+Subject: [PATCH 02/55] fixup! v4l2-ctrls: add
+ v4l2_ctrl_request_hdl_find/put/ctrl_find functions
+
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index 198b7e924d21..3610dce3a4f8 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -2997,7 +2997,7 @@ v4l2_ctrl_request_hdl_ctrl_find(struct v4l2_ctrl_handler *hdl, u32 id)
+ {
+ 	struct v4l2_ctrl_ref *ref = find_ref_lock(hdl, id);
+ 
+-	return (ref && ref->req == ref) ? ref : NULL;
++	return (ref && ref->req == ref) ? ref->ctrl : NULL;
+ }
+ EXPORT_SYMBOL_GPL(v4l2_ctrl_request_hdl_ctrl_find);
+ 
+-- 
+2.18.0
+

@@ -1,0 +1,815 @@
+From bdbd3c5b75115eaa3292ef108e51d91d521509f4 Mon Sep 17 00:00:00 2001
+From: Icenowy Zheng <icenowy@aosc.io>
+Date: Thu, 14 Jun 2018 23:35:45 +0800
+Subject: [PATCH 03/55] soc: sunxi: export a regmap for EMAC clock reg on A64
+
+The A64 SRAM controller memory zone has a EMAC clock register, which is
+needed by the Ethernet MAC driver (dwmac-sun8i).
+
+Export a regmap for this register on A64.
+
+Signed-off-by: Icenowy Zheng <icenowy@aosc.io>
+[wens@csie.org: export whole address range with only EMAC register
+		accessible and drop regmap name]
+Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+Acked-by: Maxime Ripard <maxime.ripard@bootlin.com>
+---
+ drivers/soc/sunxi/sunxi_sram.c | 57 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/sunxi/sunxi_sram.c b/drivers/soc/sunxi/sunxi_sram.c
+index 882be5ed7e84..eec7fc6e9f66 100644
+--- a/drivers/soc/sunxi/sunxi_sram.c
++++ b/drivers/soc/sunxi/sunxi_sram.c
+@@ -17,6 +17,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/regmap.h>
+ 
+ #include <linux/soc/sunxi/sunxi_sram.h>
+ 
+@@ -281,13 +282,51 @@ int sunxi_sram_release(struct device *dev)
+ }
+ EXPORT_SYMBOL(sunxi_sram_release);
+ 
++struct sunxi_sramc_variant {
++	bool has_emac_clock;
++};
++
++static const struct sunxi_sramc_variant sun4i_a10_sramc_variant = {
++	/* Nothing special */
++};
++
++static const struct sunxi_sramc_variant sun50i_a64_sramc_variant = {
++	.has_emac_clock = true,
++};
++
++#define SUNXI_SRAM_EMAC_CLOCK_REG	0x30
++static bool sunxi_sram_regmap_accessible_reg(struct device *dev,
++					     unsigned int reg)
++{
++	if (reg == SUNXI_SRAM_EMAC_CLOCK_REG)
++		return true;
++	return false;
++}
++
++static struct regmap_config sunxi_sram_emac_clock_regmap = {
++	.reg_bits       = 32,
++	.val_bits       = 32,
++	.reg_stride     = 4,
++	/* last defined register */
++	.max_register   = SUNXI_SRAM_EMAC_CLOCK_REG,
++	/* other devices have no business accessing other registers */
++	.readable_reg	= sunxi_sram_regmap_accessible_reg,
++	.writeable_reg	= sunxi_sram_regmap_accessible_reg,
++};
++
+ static int sunxi_sram_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+ 	struct dentry *d;
++	struct regmap *emac_clock;
++	const struct sunxi_sramc_variant *variant;
+ 
+ 	sram_dev = &pdev->dev;
+ 
++	variant = of_device_get_match_data(&pdev->dev);
++	if (!variant)
++		return -EINVAL;
++
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	base = devm_ioremap_resource(&pdev->dev, res);
+ 	if (IS_ERR(base))
+@@ -300,12 +339,26 @@ static int sunxi_sram_probe(struct platform_device *pdev)
+ 	if (!d)
+ 		return -ENOMEM;
+ 
++	if (variant->has_emac_clock) {
++		emac_clock = devm_regmap_init_mmio(&pdev->dev, base,
++						   &sunxi_sram_emac_clock_regmap);
++
++		if (IS_ERR(emac_clock))
++			return PTR_ERR(emac_clock);
++	}
++
+ 	return 0;
+ }
+ 
+ static const struct of_device_id sunxi_sram_dt_match[] = {
+-	{ .compatible = "allwinner,sun4i-a10-sram-controller" },
+-	{ .compatible = "allwinner,sun50i-a64-sram-controller" },
++	{
++		.compatible = "allwinner,sun4i-a10-sram-controller",
++		.data = &sun4i_a10_sramc_variant,
++	},
++	{
++		.compatible = "allwinner,sun50i-a64-sram-controller",
++		.data = &sun50i_a64_sramc_variant,
++	},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, sunxi_sram_dt_match);
+-- 
+2.18.0
+
+From e616124b3dc48d33f243ae2e8469a5f13d698cec Mon Sep 17 00:00:00 2001
+From: Chen-Yu Tsai <wens@csie.org>
+Date: Thu, 14 Jun 2018 23:35:46 +0800
+Subject: [PATCH 04/55] dt-bindings: sram: Rename A64 SRAM controller
+ compatible
+
+The SRAM mapping controls on Allwinner SoCs is located in a block called
+"System Controls". This block also has registers for identifying the SoC,
+reading the state of an external boot-related pin, and on some newer SoCs,
+glue layer controls for the EMAC Ethernet controller.
+
+The A64 variant compatible is renamed to "allwinner,a64-system-control"
+to reflect this. The old A64 compatible is deprecated. So far we haven't
+seen any actual use of it.
+
+Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+---
+ Documentation/devicetree/bindings/sram/sunxi-sram.txt | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/sram/sunxi-sram.txt b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+index d087f04a4d7f..9ef40e2e0a48 100644
+--- a/Documentation/devicetree/bindings/sram/sunxi-sram.txt
++++ b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+@@ -11,7 +11,8 @@ Controller Node
+ Required properties:
+ - compatible : should be:
+     - "allwinner,sun4i-a10-sram-controller"
+-    - "allwinner,sun50i-a64-sram-controller"
++    - "allwinner,sun50i-a64-sram-controller" (deprecated)
++    - "allwinner,sun50i-a64-system-control"
+ - reg : sram controller register offset + length
+ 
+ SRAM nodes
+-- 
+2.18.0
+
+From d662bc8ac6bbdfc3705d333d4600416ccac75fe5 Mon Sep 17 00:00:00 2001
+From: Chen-Yu Tsai <wens@csie.org>
+Date: Thu, 14 Jun 2018 23:35:47 +0800
+Subject: [PATCH 05/55] soc: sunxi: sram: Add updated compatible string for A64
+ system control
+
+The SRAM mapping controls on Allwinner SoCs is located in a block called
+"System Controls". This block also has registers for identifying the SoC,
+reading the state of an external boot-related pin, and on some newer SoCs,
+glue layer controls for the EMAC Ethernet controller.
+
+The A64 variant compatible is renamed to "allwinner,a64-system-control"
+to reflect this. The old A64 compatible is deprecated. So far we haven't
+seen any actual use of it.
+
+Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+---
+ drivers/soc/sunxi/sunxi_sram.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/soc/sunxi/sunxi_sram.c b/drivers/soc/sunxi/sunxi_sram.c
+index eec7fc6e9f66..7fec1b160dbb 100644
+--- a/drivers/soc/sunxi/sunxi_sram.c
++++ b/drivers/soc/sunxi/sunxi_sram.c
+@@ -359,6 +359,10 @@ static const struct of_device_id sunxi_sram_dt_match[] = {
+ 		.compatible = "allwinner,sun50i-a64-sram-controller",
+ 		.data = &sun50i_a64_sramc_variant,
+ 	},
++	{
++		.compatible = "allwinner,sun50i-a64-system-control",
++		.data = &sun50i_a64_sramc_variant,
++	},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, sunxi_sram_dt_match);
+-- 
+2.18.0
+
+From 2dd0b96c317f96800cd72532092baf2cb6fc3da4 Mon Sep 17 00:00:00 2001
+From: Icenowy Zheng <icenowy@aosc.io>
+Date: Thu, 14 Jun 2018 23:35:48 +0800
+Subject: [PATCH 06/55] arm64: dts: allwinner: a64: add SRAM controller device
+ tree node
+
+Allwinner A64 has a SRAM controller, and in the device tree currently
+we have a syscon node to enable EMAC driver to access the EMAC clock
+register. As SRAM controller driver can now export regmap for this
+register, replace the syscon node to the SRAM controller device node,
+and let EMAC driver to acquire its EMAC clock regmap.
+
+Signed-off-by: Icenowy Zheng <icenowy@aosc.io>
+[wens@csie.org: Updated compatible string]
+Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi
+index 1b2ef28c42bd..87968dafe1dc 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi
+@@ -169,9 +169,24 @@
+ 		ranges;
+ 
+ 		syscon: syscon@1c00000 {
+-			compatible = "allwinner,sun50i-a64-system-controller",
+-				"syscon";
++			compatible = "allwinner,sun50i-a64-system-control";
+ 			reg = <0x01c00000 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges;
++
++			sram_c: sram@18000 {
++				compatible = "mmio-sram";
++				reg = <0x00018000 0x28000>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges = <0 0x00018000 0x28000>;
++
++				de2_sram: sram-section@0 {
++					compatible = "allwinner,sun50i-a64-sram-c";
++					reg = <0x0000 0x28000>;
++				};
++			};
+ 		};
+ 
+ 		dma: dma-controller@1c02000 {
+-- 
+2.18.0
+
+From b3f886a2c7c8a818ce3321e1fc92df27db5fb3fd Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 10:54:18 +0200
+Subject: [PATCH 07/55] dt-bindings: sram: sunxi: Introduce new A10 binding for
+ system-control
+
+Following-up on the introduction of a new binding for the A64, this
+introduces a system-control binding for the A10 as a replacement of
+the sram-controller binding.
+
+This change is motivated by consistency with the Allwinner literature,
+that mentions system control over SRAM controller. Moreover, the system
+control block is sometimes used for more than SRAM (e.g. for muxing
+related to the ethernet PHY).
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ Documentation/devicetree/bindings/sram/sunxi-sram.txt | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sram/sunxi-sram.txt b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+index 9ef40e2e0a48..d7dd1a393011 100644
+--- a/Documentation/devicetree/bindings/sram/sunxi-sram.txt
++++ b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+@@ -10,7 +10,8 @@ Controller Node
+ 
+ Required properties:
+ - compatible : should be:
+-    - "allwinner,sun4i-a10-sram-controller"
++    - "allwinner,sun4i-a10-sram-controller" (deprecated)
++    - "allwinner,sun4i-a10-system-control"
+     - "allwinner,sun50i-a64-sram-controller" (deprecated)
+     - "allwinner,sun50i-a64-system-control"
+ - reg : sram controller register offset + length
+@@ -48,8 +49,8 @@ This valid values for this argument are:
+ 
+ Example
+ -------
+-sram-controller@1c00000 {
+-	compatible = "allwinner,sun4i-a10-sram-controller";
++system-control@1c00000 {
++	compatible = "allwinner,sun4i-a10-system-control";
+ 	reg = <0x01c00000 0x30>;
+ 	#address-cells = <1>;
+ 	#size-cells = <1>;
+-- 
+2.18.0
+
+From ef32db4cd5ff31cc870ef8168034ce54e7edc003 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Fri, 15 Jun 2018 14:10:17 +0200
+Subject: [PATCH 08/55] dt-bindings: sram: sunxi: Add A13, A20, A23 and H3
+ dedicated bindings
+
+This introduces dedicated bindings for the system control blocks found
+on the A13, A20, A23 and H3 sunxi platforms.
+
+Since the controllers on the A33 are the very same as those on the A23,
+no specific compatible is introduced for it.
+
+These bindings are introduced to allow reflecting the differences that
+exist between these controllers, that may become significant to driver
+implementations.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ Documentation/devicetree/bindings/sram/sunxi-sram.txt | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/sram/sunxi-sram.txt b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+index d7dd1a393011..156a02ab6b54 100644
+--- a/Documentation/devicetree/bindings/sram/sunxi-sram.txt
++++ b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+@@ -12,6 +12,10 @@ Required properties:
+ - compatible : should be:
+     - "allwinner,sun4i-a10-sram-controller" (deprecated)
+     - "allwinner,sun4i-a10-system-control"
++    - "allwinner,sun5i-a13-system-control"
++    - "allwinner,sun7i-a20-system-control"
++    - "allwinner,sun8i-a23-system-control"
++    - "allwinner,sun8i-h3-system-control"
+     - "allwinner,sun50i-a64-sram-controller" (deprecated)
+     - "allwinner,sun50i-a64-system-control"
+ - reg : sram controller register offset + length
+-- 
+2.18.0
+
+From e318deaf69e614ddf73bb69eeda759b91a5c6ced Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 11:18:57 +0200
+Subject: [PATCH 09/55] dt-bindings: sram: sunxi: Populate valid sections
+ compatibles
+
+This adds a list of valid SRAM sections compatibles for the A13, A20,
+A23 and H3 platforms. Per-platform compatibles are introduced for the
+SRAM sections of these platforms, with the A10 compatibles also listed
+as valid when applicable.
+
+In particular, compatibles for the C1 SRAM section are introduced.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ .../devicetree/bindings/sram/sunxi-sram.txt   | 25 +++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/sram/sunxi-sram.txt b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+index 156a02ab6b54..07c53c5214a0 100644
+--- a/Documentation/devicetree/bindings/sram/sunxi-sram.txt
++++ b/Documentation/devicetree/bindings/sram/sunxi-sram.txt
+@@ -32,8 +32,33 @@ once again the representation described in the mmio-sram binding.
+ 
+ The valid sections compatible for A10 are:
+     - allwinner,sun4i-a10-sram-a3-a4
++    - allwinner,sun4i-a10-sram-c1
+     - allwinner,sun4i-a10-sram-d
+ 
++The valid sections compatible for A13 are:
++    - allwinner,sun5i-a13-sram-a3-a4
++    - allwinner,sun4i-a10-sram-a3-a4
++    - allwinner,sun5i-a13-sram-c1
++    - allwinner,sun4i-a10-sram-c1
++    - allwinner,sun5i-a13-sram-d
++    - allwinner,sun4i-a10-sram-d
++
++The valid sections compatible for A20 are:
++    - allwinner,sun7i-a20-sram-a3-a4
++    - allwinner,sun4i-a10-sram-a3-a4
++    - allwinner,sun7i-a20-sram-c1
++    - allwinner,sun4i-a10-sram-c1
++    - allwinner,sun7i-a20-sram-d
++    - allwinner,sun4i-a10-sram-d
++
++The valid sections compatible for A23/A33 are:
++    - allwinner,sun8i-a23-sram-c1
++    - allwinner,sun4i-a10-sram-c1
++
++The valid sections compatible for H3 are:
++    - allwinner,sun8i-h3-sram-c1
++    - allwinner,sun4i-a10-sram-c1
++
+ The valid sections compatible for A64 are:
+     - allwinner,sun50i-a64-sram-c
+ 
+-- 
+2.18.0
+
+From 6f646c11179ddf033df0c28acf6e7d56155108cd Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 10:55:42 +0200
+Subject: [PATCH 10/55] soc: sunxi: sram: Add dt match for the A10
+ system-control compatible
+
+This binds the new A10 system-control compatible to the associated
+driver, with the same driver data as the previous compatible.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/soc/sunxi/sunxi_sram.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/soc/sunxi/sunxi_sram.c b/drivers/soc/sunxi/sunxi_sram.c
+index 7fec1b160dbb..236f34307c0f 100644
+--- a/drivers/soc/sunxi/sunxi_sram.c
++++ b/drivers/soc/sunxi/sunxi_sram.c
+@@ -355,6 +355,10 @@ static const struct of_device_id sunxi_sram_dt_match[] = {
+ 		.compatible = "allwinner,sun4i-a10-sram-controller",
+ 		.data = &sun4i_a10_sramc_variant,
+ 	},
++	{
++		.compatible = "allwinner,sun4i-a10-system-control",
++		.data = &sun4i_a10_sramc_variant,
++	},
+ 	{
+ 		.compatible = "allwinner,sun50i-a64-sram-controller",
+ 		.data = &sun50i_a64_sramc_variant,
+-- 
+2.18.0
+
+From 88f9f5f0c96579acfb3edc3b5ac4f475a66e2c34 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Mon, 7 May 2018 10:27:34 +0200
+Subject: [PATCH 11/55] drivers: soc: sunxi: Add support for the C1 SRAM region
+
+This introduces support for the SRAM C1 section, that is controlled by
+the system controller. This SRAM area can be muxed either to the CPU
+or the Video Engine, that needs this area to store various tables (e.g.
+the Huffman VLD decoding tables).
+
+This only supports devices with the same layout as the A10 (which also
+includes the A13, A20, A33 and other SoCs).
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ drivers/soc/sunxi/sunxi_sram.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/soc/sunxi/sunxi_sram.c b/drivers/soc/sunxi/sunxi_sram.c
+index 236f34307c0f..b19fa2cc67c2 100644
+--- a/drivers/soc/sunxi/sunxi_sram.c
++++ b/drivers/soc/sunxi/sunxi_sram.c
+@@ -64,6 +64,12 @@ static struct sunxi_sram_desc sun4i_a10_sram_a3_a4 = {
+ 				  SUNXI_SRAM_MAP(1, 1, "emac")),
+ };
+ 
++static struct sunxi_sram_desc sun4i_a10_sram_c1 = {
++	.data	= SUNXI_SRAM_DATA("C1", 0x0, 0x0, 31,
++				  SUNXI_SRAM_MAP(0, 0, "cpu"),
++				  SUNXI_SRAM_MAP(0x7fffffff, 1, "ve")),
++};
++
+ static struct sunxi_sram_desc sun4i_a10_sram_d = {
+ 	.data	= SUNXI_SRAM_DATA("D", 0x4, 0x0, 1,
+ 				  SUNXI_SRAM_MAP(0, 0, "cpu"),
+@@ -81,6 +87,10 @@ static const struct of_device_id sunxi_sram_dt_ids[] = {
+ 		.compatible	= "allwinner,sun4i-a10-sram-a3-a4",
+ 		.data		= &sun4i_a10_sram_a3_a4.data,
+ 	},
++	{
++		.compatible	= "allwinner,sun4i-a10-sram-c1",
++		.data		= &sun4i_a10_sram_c1.data,
++	},
+ 	{
+ 		.compatible	= "allwinner,sun4i-a10-sram-d",
+ 		.data		= &sun4i_a10_sram_d.data,
+-- 
+2.18.0
+
+From 5b24c034874c196850b4f55e18d4fef1511d2d2a Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 15:12:37 +0200
+Subject: [PATCH 12/55] ARM: dts: sun4i-a10: Use system-control compatible
+
+This switches the sun4i-a10 dtsi to use the new compatible for the
+system-control block (previously named SRAM controller) instead of
+the deprecated one.
+
+The phandle is also updated to reflect the fact that the controller
+described is really about system control rather than SRAM control.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun4i-a10.dtsi | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/boot/dts/sun4i-a10.dtsi b/arch/arm/boot/dts/sun4i-a10.dtsi
+index 3a1c6b45c9a1..82f81f06f201 100644
+--- a/arch/arm/boot/dts/sun4i-a10.dtsi
++++ b/arch/arm/boot/dts/sun4i-a10.dtsi
+@@ -190,8 +190,8 @@
+ 		#size-cells = <1>;
+ 		ranges;
+ 
+-		sram-controller@1c00000 {
+-			compatible = "allwinner,sun4i-a10-sram-controller";
++		system-control@1c00000 {
++			compatible = "allwinner,sun4i-a10-system-control";
+ 			reg = <0x01c00000 0x30>;
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+-- 
+2.18.0
+
+From 5b16eca82eacf5778d29724221186c29117eb6fb Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 15:22:40 +0200
+Subject: [PATCH 13/55] ARM: dts: sun5i: Use most-qualified system control
+ compatibles
+
+This switches the sun5i dtsi to use the most qualified compatibles for
+the system-control block (previously named SRAM controller) as well as
+the SRAM blocks. The sun4i-a10 compatibles are kept since these hardware
+blocks are backward-compatible.
+
+The phandle for system control is also updated to reflect the fact that
+the controller described is really about system control rather than SRAM
+control.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun5i.dtsi | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/boot/dts/sun5i.dtsi b/arch/arm/boot/dts/sun5i.dtsi
+index 07f2248ed5f8..68711954c293 100644
+--- a/arch/arm/boot/dts/sun5i.dtsi
++++ b/arch/arm/boot/dts/sun5i.dtsi
+@@ -114,8 +114,9 @@
+ 		#size-cells = <1>;
+ 		ranges;
+ 
+-		sram-controller@1c00000 {
+-			compatible = "allwinner,sun4i-a10-sram-controller";
++		system-control@1c00000 {
++			compatible = "allwinner,sun5i-a13-system-control",
++				     "allwinner,sun4i-a10-system-control";
+ 			reg = <0x01c00000 0x30>;
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+@@ -130,7 +131,8 @@
+ 			};
+ 
+ 			emac_sram: sram-section@8000 {
+-				compatible = "allwinner,sun4i-a10-sram-a3-a4";
++				compatible = "allwinner,sun5i-a13-sram-a3-a4",
++					     "allwinner,sun4i-a10-sram-a3-a4";
+ 				reg = <0x8000 0x4000>;
+ 				status = "disabled";
+ 			};
+@@ -143,7 +145,8 @@
+ 				ranges = <0 0x00010000 0x1000>;
+ 
+ 				otg_sram: sram-section@0 {
+-					compatible = "allwinner,sun4i-a10-sram-d";
++					compatible = "allwinner,sun5i-a13-sram-d",
++						     "allwinner,sun4i-a10-sram-d";
+ 					reg = <0x0000 0x1000>;
+ 					status = "disabled";
+ 				};
+-- 
+2.18.0
+
+From d64886cc2b3d44adc90c7fb6da4578a9314bf460 Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 15:25:48 +0200
+Subject: [PATCH 14/55] ARM: dts: sun7i-a20: Use most-qualified system control
+ compatibles
+
+This switches the sun7i-a20 dtsi to use the most qualified compatibles
+for the system-control block (previously named SRAM controller) as well
+as the SRAM blocks. The sun4i-a10 compatibles are kept since these
+hardware blocks are backward-compatible.
+
+The phandle for system control is also updated to reflect the fact that
+the controller described is really about system control rather than SRAM
+control.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun7i-a20.dtsi | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/boot/dts/sun7i-a20.dtsi b/arch/arm/boot/dts/sun7i-a20.dtsi
+index e529e4ff2174..59abb623b249 100644
+--- a/arch/arm/boot/dts/sun7i-a20.dtsi
++++ b/arch/arm/boot/dts/sun7i-a20.dtsi
+@@ -239,8 +239,9 @@
+ 		#size-cells = <1>;
+ 		ranges;
+ 
+-		sram-controller@1c00000 {
+-			compatible = "allwinner,sun4i-a10-sram-controller";
++		system-control@1c00000 {
++			compatible = "allwinner,sun7i-a20-system-control",
++				     "allwinner,sun4i-a10-system-control";
+ 			reg = <0x01c00000 0x30>;
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+@@ -254,7 +255,8 @@
+ 				ranges = <0 0x00000000 0xc000>;
+ 
+ 				emac_sram: sram-section@8000 {
+-					compatible = "allwinner,sun4i-a10-sram-a3-a4";
++					compatible = "allwinner,sun7i-a20-sram-a3-a4",
++						     "allwinner,sun4i-a10-sram-a3-a4";
+ 					reg = <0x8000 0x4000>;
+ 					status = "disabled";
+ 				};
+@@ -268,7 +270,8 @@
+ 				ranges = <0 0x00010000 0x1000>;
+ 
+ 				otg_sram: sram-section@0 {
+-					compatible = "allwinner,sun4i-a10-sram-d";
++					compatible = "allwinner,sun7i-a20-sram-d",
++						     "allwinner,sun4i-a10-sram-d";
+ 					reg = <0x0000 0x1000>;
+ 					status = "disabled";
+ 				};
+-- 
+2.18.0
+
+From 3dd1fefc99b87cf1940fc6e5910e2c9c993060eb Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Mon, 7 May 2018 10:28:01 +0200
+Subject: [PATCH 15/55] ARM: sun5i: Add support for the C1 SRAM region with the
+ SRAM controller
+
+This adds support for the C1 SRAM region (to be used with the SRAM
+controller driver) for sun5i-based platforms. The region is shared
+between the Video Engine and the CPU.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun5i.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm/boot/dts/sun5i.dtsi b/arch/arm/boot/dts/sun5i.dtsi
+index 68711954c293..51dcefc76c12 100644
+--- a/arch/arm/boot/dts/sun5i.dtsi
++++ b/arch/arm/boot/dts/sun5i.dtsi
+@@ -137,6 +137,20 @@
+ 				status = "disabled";
+ 			};
+ 
++			sram_c: sram@1d00000 {
++				compatible = "mmio-sram";
++				reg = <0x01d00000 0x80000>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges = <0 0x01d00000 0x80000>;
++
++				ve_sram: sram-section@0 {
++					compatible = "allwinner,sun5i-a13-sram-c1",
++						     "allwinner,sun4i-a10-sram-c1";
++					reg = <0x000000 0x80000>;
++				};
++			};
++
+ 			sram_d: sram@10000 {
+ 				compatible = "mmio-sram";
+ 				reg = <0x00010000 0x1000>;
+-- 
+2.18.0
+
+From 5465b3197886f61b0d9e2c492b55179234e1a465 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Mon, 7 May 2018 10:28:35 +0200
+Subject: [PATCH 16/55] ARM: sun7i-a20: Add support for the C1 SRAM region with
+ the SRAM controller
+
+This adds support for the C1 SRAM region (to be used with the SRAM
+controller driver) for the A20 platform. The region is shared
+between the Video Engine and the CPU.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun7i-a20.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm/boot/dts/sun7i-a20.dtsi b/arch/arm/boot/dts/sun7i-a20.dtsi
+index 59abb623b249..38999d791cb5 100644
+--- a/arch/arm/boot/dts/sun7i-a20.dtsi
++++ b/arch/arm/boot/dts/sun7i-a20.dtsi
+@@ -276,6 +276,20 @@
+ 					status = "disabled";
+ 				};
+ 			};
++
++			sram_c: sram@1d00000 {
++				compatible = "mmio-sram";
++				reg = <0x01d00000 0x80000>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges = <0 0x01d00000 0x80000>;
++
++				ve_sram: sram-section@0 {
++					compatible = "allwinner,sun7i-a20-sram-c1",
++						     "allwinner,sun4i-a10-sram-c1";
++					reg = <0x000000 0x80000>;
++				};
++			};
+ 		};
+ 
+ 		nmi_intc: interrupt-controller@1c00030 {
+-- 
+2.18.0
+
+From f2b3a327fe6c11bdd3a0caeaaa55580c92c3a529 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Mon, 7 May 2018 10:28:59 +0200
+Subject: [PATCH 17/55] ARM: sun8i-a23-a33: Add SRAM controller node and C1
+ SRAM region
+
+This adds a SRAM controller node for the A23 and A33, with support for
+the C1 SRAM region that is shared between the Video Engine and the CPU.
+
+Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun8i-a23-a33.dtsi | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/arch/arm/boot/dts/sun8i-a23-a33.dtsi b/arch/arm/boot/dts/sun8i-a23-a33.dtsi
+index 44f3cad3de75..ad2dd62205d6 100644
+--- a/arch/arm/boot/dts/sun8i-a23-a33.dtsi
++++ b/arch/arm/boot/dts/sun8i-a23-a33.dtsi
+@@ -124,6 +124,29 @@
+ 		#size-cells = <1>;
+ 		ranges;
+ 
++		system-control@1c00000 {
++			compatible = "allwinner,sun8i-a23-system-control",
++				     "allwinner,sun4i-a10-system-control";
++			reg = <0x01c00000 0x30>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges;
++
++			sram_c: sram@1d00000 {
++				compatible = "mmio-sram";
++				reg = <0x01d00000 0x80000>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges = <0 0x01d00000 0x80000>;
++
++				ve_sram: sram-section@0 {
++					compatible = "allwinner,sun8i-a23-sram-c1",
++						     "allwinner,sun4i-a10-sram-c1";
++					reg = <0x000000 0x80000>;
++				};
++			};
++		};
++
+ 		dma: dma-controller@1c02000 {
+ 			compatible = "allwinner,sun8i-a23-dma";
+ 			reg = <0x01c02000 0x1000>;
+-- 
+2.18.0
+
+From 43a79843224210c84490840acf3aa081d05fe39d Mon Sep 17 00:00:00 2001
+From: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+Date: Wed, 27 Jun 2018 15:59:14 +0200
+Subject: [PATCH 18/55] ARM: sun8i-h3: Add SRAM controller node and C1 SRAM
+ region
+
+This adds a SRAM controller node for the H3, with support for the C1
+SRAM region that is shared between the Video Engine and the CPU.
+
+Signed-off-by: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+---
+ arch/arm/boot/dts/sun8i-h3.dtsi | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/arch/arm/boot/dts/sun8i-h3.dtsi b/arch/arm/boot/dts/sun8i-h3.dtsi
+index 41d57c76f290..c93f6be40533 100644
+--- a/arch/arm/boot/dts/sun8i-h3.dtsi
++++ b/arch/arm/boot/dts/sun8i-h3.dtsi
+@@ -111,6 +111,29 @@
+ 	};
+ 
+ 	soc {
++		system-control@1c00000 {
++			compatible = "allwinner,sun8i-h3-system-control",
++				     "allwinner,sun4i-a10-system-control";
++			reg = <0x01c00000 0x30>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges;
++
++			sram_c: sram@1d00000 {
++				compatible = "mmio-sram";
++				reg = <0x01d00000 0x80000>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges = <0 0x01d00000 0x80000>;
++
++				ve_sram: sram-section@0 {
++					compatible = "allwinner,sun8i-h3-sram-c1",
++						     "allwinner,sun4i-a10-sram-c1";
++					reg = <0x000000 0x80000>;
++				};
++			};
++		};
++
+ 		mali: gpu@1c40000 {
+ 			compatible = "allwinner,sun8i-h3-mali", "arm,mali-400";
+ 			reg = <0x01c40000 0x10000>;
+-- 
+2.18.0
+

@@ -1,0 +1,842 @@
+From ac87c8ddb619caaf06ee10a0b84ed476b025118a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Niklas=20S=C3=B6derlund?=
+ <niklas.soderlund+renesas@ragnatech.se>
+Date: Thu, 17 May 2018 10:30:15 -0400
+Subject: [PATCH] media: v4l2-ioctl: create helper to fill in v4l2_standard for
+ ENUMSTD
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Prepare for adding a new IOCTL VIDIOC_SUBDEV_ENUMSTD which would
+enumerate the standards for a subdevice by breaking out the code which
+could be shared between the video and subdevice versions of this IOCTL.
+
+Signed-off-by: Niklas Söderlund <niklas.soderlund+renesas@ragnatech.se>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+[hans.verkuil@cisco.com: fixed 'sdandard' typos in v4l2-ioctl.h]
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/v4l2-core/v4l2-ioctl.c | 66 ++++++++++++++++------------
+ include/media/v4l2-ioctl.h           | 15 ++++++-
+ 2 files changed, 50 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index dd210067151f..eeed14468a17 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -125,6 +125,42 @@ int v4l2_video_std_construct(struct v4l2_standard *vs,
+ }
+ EXPORT_SYMBOL(v4l2_video_std_construct);
+ 
++/* Fill in the fields of a v4l2_standard structure according to the
++ * 'id' and 'vs->index' parameters. Returns negative on error. */
++int v4l_video_std_enumstd(struct v4l2_standard *vs, v4l2_std_id id)
++{
++	v4l2_std_id curr_id = 0;
++	unsigned int index = vs->index, i, j = 0;
++	const char *descr = "";
++
++	/* Return -ENODATA if the id for the current input
++	   or output is 0, meaning that it doesn't support this API. */
++	if (id == 0)
++		return -ENODATA;
++
++	/* Return norm array in a canonical way */
++	for (i = 0; i <= index && id; i++) {
++		/* last std value in the standards array is 0, so this
++		   while always ends there since (id & 0) == 0. */
++		while ((id & standards[j].std) != standards[j].std)
++			j++;
++		curr_id = standards[j].std;
++		descr = standards[j].descr;
++		j++;
++		if (curr_id == 0)
++			break;
++		if (curr_id != V4L2_STD_PAL &&
++				curr_id != V4L2_STD_SECAM &&
++				curr_id != V4L2_STD_NTSC)
++			id &= ~curr_id;
++	}
++	if (i <= index)
++		return -EINVAL;
++
++	v4l2_video_std_construct(vs, curr_id, descr);
++	return 0;
++}
++
+ /* ----------------------------------------------------------------- */
+ /* some arrays for pretty-printing debug messages of enum types      */
+ 
+@@ -1753,36 +1789,8 @@ static int v4l_enumstd(const struct v4l2_ioctl_ops *ops,
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_standard *p = arg;
+-	v4l2_std_id id = vfd->tvnorms, curr_id = 0;
+-	unsigned int index = p->index, i, j = 0;
+-	const char *descr = "";
+-
+-	/* Return -ENODATA if the tvnorms for the current input
+-	   or output is 0, meaning that it doesn't support this API. */
+-	if (id == 0)
+-		return -ENODATA;
+ 
+-	/* Return norm array in a canonical way */
+-	for (i = 0; i <= index && id; i++) {
+-		/* last std value in the standards array is 0, so this
+-		   while always ends there since (id & 0) == 0. */
+-		while ((id & standards[j].std) != standards[j].std)
+-			j++;
+-		curr_id = standards[j].std;
+-		descr = standards[j].descr;
+-		j++;
+-		if (curr_id == 0)
+-			break;
+-		if (curr_id != V4L2_STD_PAL &&
+-				curr_id != V4L2_STD_SECAM &&
+-				curr_id != V4L2_STD_NTSC)
+-			id &= ~curr_id;
+-	}
+-	if (i <= index)
+-		return -EINVAL;
+-
+-	v4l2_video_std_construct(p, curr_id, descr);
+-	return 0;
++	return v4l_video_std_enumstd(p, vfd->tvnorms);
+ }
+ 
+ static int v4l_s_std(const struct v4l2_ioctl_ops *ops,
+diff --git a/include/media/v4l2-ioctl.h b/include/media/v4l2-ioctl.h
+index a8dbf5b54b5c..5848d92c30da 100644
+--- a/include/media/v4l2-ioctl.h
++++ b/include/media/v4l2-ioctl.h
+@@ -621,7 +621,7 @@ const char *v4l2_norm_to_name(v4l2_std_id id);
+  * v4l2_video_std_frame_period - Ancillary routine that fills a
+  *	struct &v4l2_fract pointer with the default framerate fraction.
+  *
+- * @id: analog TV sdandard ID.
++ * @id: analog TV standard ID.
+  * @frameperiod: struct &v4l2_fract pointer to be filled
+  *
+  */
+@@ -632,7 +632,7 @@ void v4l2_video_std_frame_period(int id, struct v4l2_fract *frameperiod);
+  *	a &v4l2_standard structure according to the @id parameter.
+  *
+  * @vs: struct &v4l2_standard pointer to be filled
+- * @id: analog TV sdandard ID.
++ * @id: analog TV standard ID.
+  * @name: name of the standard to be used
+  *
+  * .. note::
+@@ -642,6 +642,17 @@ void v4l2_video_std_frame_period(int id, struct v4l2_fract *frameperiod);
+ int v4l2_video_std_construct(struct v4l2_standard *vs,
+ 				    int id, const char *name);
+ 
++/**
++ * v4l_video_std_enumstd - Ancillary routine that fills in the fields of
++ *	a &v4l2_standard structure according to the @id and @vs->index
++ *	parameters.
++ *
++ * @vs: struct &v4l2_standard pointer to be filled.
++ * @id: analog TV standard ID.
++ *
++ */
++int v4l_video_std_enumstd(struct v4l2_standard *vs, v4l2_std_id id);
++
+ /**
+  * v4l_printk_ioctl - Ancillary routine that prints the ioctl in a
+  *	human-readable format.
+-- 
+2.18.0
+
+From 561a84246b228bafa94ddf61de51cc2fd7321769 Mon Sep 17 00:00:00 2001
+From: Ezequiel Garcia <ezequiel@collabora.com>
+Date: Tue, 12 Jun 2018 09:22:51 -0400
+Subject: [PATCH] media: mem2mem: Remove excessive try_run call
+
+If there is a schedulable job, v4l2_m2m_try_schedule() calls
+v4l2_m2m_try_run(). This makes the unconditional v4l2_m2m_try_run()
+called by v4l2_m2m_job_finish superfluous. Remove it.
+
+Fixes: 7f98639def42 ("V4L/DVB: add memory-to-memory device helper framework for videobuf")
+
+Signed-off-by: Ezequiel Garcia <ezequiel@collabora.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/v4l2-core/v4l2-mem2mem.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index c4f963d96a79..5f9cd5b74cda 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -339,7 +339,6 @@ void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
+ 	 * allow more than one job on the job_queue per instance, each has
+ 	 * to be scheduled separately after the previous one finishes. */
+ 	v4l2_m2m_try_schedule(m2m_ctx);
+-	v4l2_m2m_try_run(m2m_dev);
+ }
+ EXPORT_SYMBOL(v4l2_m2m_job_finish);
+ 
+-- 
+2.18.0
+
+From cc52d869c1f2459044423db0ec42800877321792 Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hansverk@cisco.com>
+Date: Fri, 15 Jun 2018 15:07:21 -0400
+Subject: [PATCH] media: v4l2-ioctl.c: use correct vb2_queue lock for m2m
+ devices
+
+For m2m devices the vdev->queue lock was always taken instead of the
+lock for the specific capture or output queue. Now that we pushed
+the locking down into __video_do_ioctl() we can pick the correct
+lock and potentially improve the performance of m2m devices.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/v4l2-core/v4l2-ioctl.c | 56 +++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index eeed14468a17..01670567641a 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -29,6 +29,7 @@
+ #include <media/v4l2-device.h>
+ #include <media/videobuf2-v4l2.h>
+ #include <media/v4l2-mc.h>
++#include <media/v4l2-mem2mem.h>
+ 
+ #include <trace/events/v4l2.h>
+ 
+@@ -2670,11 +2671,62 @@ static bool v4l2_is_known_ioctl(unsigned int cmd)
+ 	return v4l2_ioctls[_IOC_NR(cmd)].ioctl == cmd;
+ }
+ 
++#if IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
++static bool v4l2_ioctl_m2m_queue_is_output(unsigned int cmd, void *arg)
++{
++	switch (cmd) {
++	case VIDIOC_CREATE_BUFS: {
++		struct v4l2_create_buffers *cbufs = arg;
++
++		return V4L2_TYPE_IS_OUTPUT(cbufs->format.type);
++	}
++	case VIDIOC_REQBUFS: {
++		struct v4l2_requestbuffers *rbufs = arg;
++
++		return V4L2_TYPE_IS_OUTPUT(rbufs->type);
++	}
++	case VIDIOC_QBUF:
++	case VIDIOC_DQBUF:
++	case VIDIOC_QUERYBUF:
++	case VIDIOC_PREPARE_BUF: {
++		struct v4l2_buffer *buf = arg;
++
++		return V4L2_TYPE_IS_OUTPUT(buf->type);
++	}
++	case VIDIOC_EXPBUF: {
++		struct v4l2_exportbuffer *expbuf = arg;
++
++		return V4L2_TYPE_IS_OUTPUT(expbuf->type);
++	}
++	case VIDIOC_STREAMON:
++	case VIDIOC_STREAMOFF: {
++		int *type = arg;
++
++		return V4L2_TYPE_IS_OUTPUT(*type);
++	}
++	default:
++		return false;
++	}
++}
++#endif
++
+ static struct mutex *v4l2_ioctl_get_lock(struct video_device *vdev,
+-					 unsigned int cmd)
++					 struct v4l2_fh *vfh, unsigned int cmd,
++					 void *arg)
+ {
+ 	if (_IOC_NR(cmd) >= V4L2_IOCTLS)
+ 		return vdev->lock;
++#if IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
++	if (vfh && vfh->m2m_ctx &&
++	    (v4l2_ioctls[_IOC_NR(cmd)].flags & INFO_FL_QUEUE)) {
++		bool is_output = v4l2_ioctl_m2m_queue_is_output(cmd, arg);
++		struct v4l2_m2m_queue_ctx *ctx = is_output ?
++			&vfh->m2m_ctx->out_q_ctx : &vfh->m2m_ctx->cap_q_ctx;
++
++		if (ctx->q.lock)
++			return ctx->q.lock;
++	}
++#endif
+ 	if (vdev->queue && vdev->queue->lock &&
+ 			(v4l2_ioctls[_IOC_NR(cmd)].flags & INFO_FL_QUEUE))
+ 		return vdev->queue->lock;
+@@ -2741,7 +2793,7 @@ static long __video_do_ioctl(struct file *file,
+ 	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
+ 		vfh = file->private_data;
+ 
+-	lock = v4l2_ioctl_get_lock(vfd, cmd);
++	lock = v4l2_ioctl_get_lock(vfd, vfh, cmd, arg);
+ 
+ 	if (lock && mutex_lock_interruptible(lock))
+ 		return -ERESTARTSYS;
+-- 
+2.18.0
+
+From 5b039e5d50e8276c4d1ed1d2f4c770876d58f958 Mon Sep 17 00:00:00 2001
+From: Steve Longerbeam <slongerbeam@gmail.com>
+Date: Wed, 27 Jun 2018 14:39:43 -0400
+Subject: [PATCH] media: v4l2-ctrls: Fix CID base conflict between MAX217X and
+ IMX
+
+When the imx-media driver was initially merged, there was a conflict
+with 8d67ae25 ("media: v4l2-ctrls: Reserve controls for MAX217X") which
+was not fixed up correctly, resulting in V4L2_CID_USER_MAX217X_BASE and
+V4L2_CID_USER_IMX_BASE taking on the same value. Fix by assigning imx
+CID base the next available range at 0x10b0.
+
+Signed-off-by: Steve Longerbeam <steve_longerbeam@mentor.com>
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ include/uapi/linux/v4l2-controls.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index 8d473c979b61..8a75ad7899f3 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -188,7 +188,7 @@ enum v4l2_colorfx {
+ 
+ /* The base for the imx driver controls.
+  * We reserve 16 controls for this driver. */
+-#define V4L2_CID_USER_IMX_BASE			(V4L2_CID_USER_BASE + 0x1090)
++#define V4L2_CID_USER_IMX_BASE			(V4L2_CID_USER_BASE + 0x10b0)
+ 
+ /* MPEG-class control IDs */
+ /* The MPEG controls are applicable to all codec controls
+-- 
+2.18.0
+
+From 8e93c47d80f46f911ec17a57eaedb16bd23da4de Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hverkuil@xs4all.nl>
+Date: Fri, 29 Jun 2018 06:12:43 -0400
+Subject: [PATCH] media: v4l2-ctrls.c: fix broken auto cluster handling
+
+When you switch from auto to manual mode for an auto-cluster (e.g.
+autogain+gain controls), then the current HW value has to be copied
+to the current control value. However, has_changed was never set to
+true, so new_to_cur didn't actually copy this value.
+
+Reported-by: Hugues FRUCHET <hugues.fruchet@st.com>
+Tested-by: Hugues FRUCHET <hugues.fruchet@st.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index d29e45516eb7..d1087573da34 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -3137,9 +3137,22 @@ static int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
+ 
+ 	/* If OK, then make the new values permanent. */
+ 	update_flag = is_cur_manual(master) != is_new_manual(master);
+-	for (i = 0; i < master->ncontrols; i++)
++
++	for (i = 0; i < master->ncontrols; i++) {
++		/*
++		 * If we switch from auto to manual mode, and this cluster
++		 * contains volatile controls, then all non-master controls
++		 * have to be marked as changed. The 'new' value contains
++		 * the volatile value (obtained by update_from_auto_cluster),
++		 * which now has to become the current value.
++		 */
++		if (i && update_flag && is_new_manual(master) &&
++		    master->has_volatiles && master->cluster[i])
++			master->cluster[i]->has_changed = true;
++
+ 		new_to_cur(fh, master->cluster[i], ch_flags |
+ 			((update_flag && i > 0) ? V4L2_EVENT_CTRL_CH_FLAGS : 0));
++	}
+ 	return 0;
+ }
+ 
+-- 
+2.18.0
+
+From d0a3a94af14fa9f38fb977fa502193ea62a4825a Mon Sep 17 00:00:00 2001
+From: Hans Verkuil <hverkuil@xs4all.nl>
+Date: Mon, 2 Jul 2018 08:43:02 -0400
+Subject: [PATCH] media: mark entity-intf links as IMMUTABLE
+
+Currently links between entities and an interface are just marked as
+ENABLED. But (at least today) these links cannot be disabled by userspace
+or the driver, so they should also be marked as IMMUTABLE.
+
+It might become possible that drivers can disable such links (if for some
+reason the device node cannot be used), so we might need to add a new link
+flag at some point to mark interface links that can be changed by the driver
+but not by userspace.
+
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/dvb-core/dvbdev.c       | 18 ++++++++++++------
+ drivers/media/v4l2-core/v4l2-dev.c    |  3 ++-
+ drivers/media/v4l2-core/v4l2-device.c |  3 ++-
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/dvb-core/dvbdev.c b/drivers/media/dvb-core/dvbdev.c
+index 64d6793674b9..3c8778570331 100644
+--- a/drivers/media/dvb-core/dvbdev.c
++++ b/drivers/media/dvb-core/dvbdev.c
+@@ -440,8 +440,10 @@ static int dvb_register_media_device(struct dvb_device *dvbdev,
+ 	if (!dvbdev->entity)
+ 		return 0;
+ 
+-	link = media_create_intf_link(dvbdev->entity, &dvbdev->intf_devnode->intf,
+-				      MEDIA_LNK_FL_ENABLED);
++	link = media_create_intf_link(dvbdev->entity,
++				      &dvbdev->intf_devnode->intf,
++				      MEDIA_LNK_FL_ENABLED |
++				      MEDIA_LNK_FL_IMMUTABLE);
+ 	if (!link)
+ 		return -ENOMEM;
+ #endif
+@@ -599,7 +601,8 @@ static int dvb_create_io_intf_links(struct dvb_adapter *adap,
+ 			if (strncmp(entity->name, name, strlen(name)))
+ 				continue;
+ 			link = media_create_intf_link(entity, intf,
+-						      MEDIA_LNK_FL_ENABLED);
++						      MEDIA_LNK_FL_ENABLED |
++						      MEDIA_LNK_FL_IMMUTABLE);
+ 			if (!link)
+ 				return -ENOMEM;
+ 		}
+@@ -754,14 +757,16 @@ int dvb_create_media_graph(struct dvb_adapter *adap,
+ 	media_device_for_each_intf(intf, mdev) {
+ 		if (intf->type == MEDIA_INTF_T_DVB_CA && ca) {
+ 			link = media_create_intf_link(ca, intf,
+-						      MEDIA_LNK_FL_ENABLED);
++						      MEDIA_LNK_FL_ENABLED |
++						      MEDIA_LNK_FL_IMMUTABLE);
+ 			if (!link)
+ 				return -ENOMEM;
+ 		}
+ 
+ 		if (intf->type == MEDIA_INTF_T_DVB_FE && tuner) {
+ 			link = media_create_intf_link(tuner, intf,
+-						      MEDIA_LNK_FL_ENABLED);
++						      MEDIA_LNK_FL_ENABLED |
++						      MEDIA_LNK_FL_IMMUTABLE);
+ 			if (!link)
+ 				return -ENOMEM;
+ 		}
+@@ -773,7 +778,8 @@ int dvb_create_media_graph(struct dvb_adapter *adap,
+ 		 */
+ 		if (intf->type == MEDIA_INTF_T_DVB_DVR && demux) {
+ 			link = media_create_intf_link(demux, intf,
+-						      MEDIA_LNK_FL_ENABLED);
++						      MEDIA_LNK_FL_ENABLED |
++						      MEDIA_LNK_FL_IMMUTABLE);
+ 			if (!link)
+ 				return -ENOMEM;
+ 		}
+diff --git a/drivers/media/v4l2-core/v4l2-dev.c b/drivers/media/v4l2-core/v4l2-dev.c
+index 4ffd7d60a901..5f43f63fa700 100644
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -808,7 +808,8 @@ static int video_register_media_controller(struct video_device *vdev, int type)
+ 
+ 		link = media_create_intf_link(&vdev->entity,
+ 					      &vdev->intf_devnode->intf,
+-					      MEDIA_LNK_FL_ENABLED);
++					      MEDIA_LNK_FL_ENABLED |
++					      MEDIA_LNK_FL_IMMUTABLE);
+ 		if (!link) {
+ 			media_devnode_remove(vdev->intf_devnode);
+ 			media_device_unregister_entity(&vdev->entity);
+diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l2-device.c
+index 937c6de85606..3940e55c72f1 100644
+--- a/drivers/media/v4l2-core/v4l2-device.c
++++ b/drivers/media/v4l2-core/v4l2-device.c
+@@ -267,7 +267,8 @@ int v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev)
+ 
+ 			link = media_create_intf_link(&sd->entity,
+ 						      &vdev->intf_devnode->intf,
+-						      MEDIA_LNK_FL_ENABLED);
++						      MEDIA_LNK_FL_ENABLED |
++						      MEDIA_LNK_FL_IMMUTABLE);
+ 			if (!link) {
+ 				err = -ENOMEM;
+ 				goto clean_up;
+-- 
+2.18.0
+
+From ce41c0ac362bc085e83b3e325dc139b686405e12 Mon Sep 17 00:00:00 2001
+From: Ezequiel Garcia <ezequiel@collabora.com>
+Date: Mon, 2 Jul 2018 11:36:05 -0400
+Subject: [PATCH] media: add helpers for memory-to-memory media controller
+
+A memory-to-memory pipeline device consists in three
+entities: two DMA engine and one video processing entities.
+The DMA engine entities are linked to a V4L interface.
+
+This commit add a new v4l2_m2m_{un}register_media_controller
+API to register this topology.
+
+For instance, a typical mem2mem device topology would
+look like this:
+
+Device topology
+- entity 1: source (1 pad, 1 link)
+            type Node subtype V4L flags 0
+	pad0: Source
+		-> "proc":1 [ENABLED,IMMUTABLE]
+
+- entity 3: proc (2 pads, 2 links)
+            type Node subtype Unknown flags 0
+	pad0: Source
+		-> "sink":0 [ENABLED,IMMUTABLE]
+	pad1: Sink
+		<- "source":0 [ENABLED,IMMUTABLE]
+
+- entity 6: sink (1 pad, 1 link)
+            type Node subtype V4L flags 0
+	pad0: Sink
+		<- "proc":0 [ENABLED,IMMUTABLE]
+
+[hans.verkuil@cisco.com: mark interface links as IMMUTABLE]
+
+Suggested-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ezequiel Garcia <ezequiel@collabora.com>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+---
+ drivers/media/v4l2-core/v4l2-dev.c     |  13 +-
+ drivers/media/v4l2-core/v4l2-mem2mem.c | 190 +++++++++++++++++++++++++
+ include/media/v4l2-mem2mem.h           |  19 +++
+ 3 files changed, 217 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-dev.c b/drivers/media/v4l2-core/v4l2-dev.c
+index 5f43f63fa700..69e775930fc4 100644
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -202,7 +202,7 @@ static void v4l2_device_release(struct device *cd)
+ 	mutex_unlock(&videodev_lock);
+ 
+ #if defined(CONFIG_MEDIA_CONTROLLER)
+-	if (v4l2_dev->mdev) {
++	if (v4l2_dev->mdev && vdev->vfl_dir != VFL_DIR_M2M) {
+ 		/* Remove interfaces and interface links */
+ 		media_devnode_remove(vdev->intf_devnode);
+ 		if (vdev->entity.function != MEDIA_ENT_F_UNKNOWN)
+@@ -733,19 +733,22 @@ static void determine_valid_ioctls(struct video_device *vdev)
+ 			BASE_VIDIOC_PRIVATE);
+ }
+ 
+-static int video_register_media_controller(struct video_device *vdev, int type)
++static int video_register_media_controller(struct video_device *vdev)
+ {
+ #if defined(CONFIG_MEDIA_CONTROLLER)
+ 	u32 intf_type;
+ 	int ret;
+ 
+-	if (!vdev->v4l2_dev->mdev)
++	/* Memory-to-memory devices are more complex and use
++	 * their own function to register its mc entities.
++	 */
++	if (!vdev->v4l2_dev->mdev || vdev->vfl_dir == VFL_DIR_M2M)
+ 		return 0;
+ 
+ 	vdev->entity.obj_type = MEDIA_ENTITY_TYPE_VIDEO_DEVICE;
+ 	vdev->entity.function = MEDIA_ENT_F_UNKNOWN;
+ 
+-	switch (type) {
++	switch (vdev->vfl_type) {
+ 	case VFL_TYPE_GRABBER:
+ 		intf_type = MEDIA_INTF_T_V4L_VIDEO;
+ 		vdev->entity.function = MEDIA_ENT_F_IO_V4L;
+@@ -994,7 +997,7 @@ int __video_register_device(struct video_device *vdev,
+ 	v4l2_device_get(vdev->v4l2_dev);
+ 
+ 	/* Part 5: Register the entity. */
+-	ret = video_register_media_controller(vdev, type);
++	ret = video_register_media_controller(vdev);
+ 
+ 	/* Part 6: Activate this minor. The char device can now be used. */
+ 	set_bit(V4L2_FL_REGISTERED, &vdev->flags);
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index 5f9cd5b74cda..725da74d15d8 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -17,9 +17,11 @@
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ 
++#include <media/media-device.h>
+ #include <media/videobuf2-v4l2.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/v4l2-dev.h>
++#include <media/v4l2-device.h>
+ #include <media/v4l2-fh.h>
+ #include <media/v4l2-event.h>
+ 
+@@ -50,6 +52,17 @@ module_param(debug, bool, 0644);
+  * offsets but for different queues */
+ #define DST_QUEUE_OFF_BASE	(1 << 30)
+ 
++enum v4l2_m2m_entity_type {
++	MEM2MEM_ENT_TYPE_SOURCE,
++	MEM2MEM_ENT_TYPE_SINK,
++	MEM2MEM_ENT_TYPE_PROC
++};
++
++static const char * const m2m_entity_name[] = {
++	"source",
++	"sink",
++	"proc"
++};
+ 
+ /**
+  * struct v4l2_m2m_dev - per-device context
+@@ -60,6 +73,15 @@ module_param(debug, bool, 0644);
+  */
+ struct v4l2_m2m_dev {
+ 	struct v4l2_m2m_ctx	*curr_ctx;
++#ifdef CONFIG_MEDIA_CONTROLLER
++	struct media_entity	*source;
++	struct media_pad	source_pad;
++	struct media_entity	sink;
++	struct media_pad	sink_pad;
++	struct media_entity	proc;
++	struct media_pad	proc_pads[2];
++	struct media_intf_devnode *intf_devnode;
++#endif
+ 
+ 	struct list_head	job_queue;
+ 	spinlock_t		job_spinlock;
+@@ -594,6 +616,174 @@ int v4l2_m2m_mmap(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ }
+ EXPORT_SYMBOL(v4l2_m2m_mmap);
+ 
++#if defined(CONFIG_MEDIA_CONTROLLER)
++void v4l2_m2m_unregister_media_controller(struct v4l2_m2m_dev *m2m_dev)
++{
++	media_remove_intf_links(&m2m_dev->intf_devnode->intf);
++	media_devnode_remove(m2m_dev->intf_devnode);
++
++	media_entity_remove_links(m2m_dev->source);
++	media_entity_remove_links(&m2m_dev->sink);
++	media_entity_remove_links(&m2m_dev->proc);
++	media_device_unregister_entity(m2m_dev->source);
++	media_device_unregister_entity(&m2m_dev->sink);
++	media_device_unregister_entity(&m2m_dev->proc);
++	kfree(m2m_dev->source->name);
++	kfree(m2m_dev->sink.name);
++	kfree(m2m_dev->proc.name);
++}
++EXPORT_SYMBOL_GPL(v4l2_m2m_unregister_media_controller);
++
++static int v4l2_m2m_register_entity(struct media_device *mdev,
++	struct v4l2_m2m_dev *m2m_dev, enum v4l2_m2m_entity_type type,
++	struct video_device *vdev, int function)
++{
++	struct media_entity *entity;
++	struct media_pad *pads;
++	char *name;
++	unsigned int len;
++	int num_pads;
++	int ret;
++
++	switch (type) {
++	case MEM2MEM_ENT_TYPE_SOURCE:
++		entity = m2m_dev->source;
++		pads = &m2m_dev->source_pad;
++		pads[0].flags = MEDIA_PAD_FL_SOURCE;
++		num_pads = 1;
++		break;
++	case MEM2MEM_ENT_TYPE_SINK:
++		entity = &m2m_dev->sink;
++		pads = &m2m_dev->sink_pad;
++		pads[0].flags = MEDIA_PAD_FL_SINK;
++		num_pads = 1;
++		break;
++	case MEM2MEM_ENT_TYPE_PROC:
++		entity = &m2m_dev->proc;
++		pads = m2m_dev->proc_pads;
++		pads[0].flags = MEDIA_PAD_FL_SINK;
++		pads[1].flags = MEDIA_PAD_FL_SOURCE;
++		num_pads = 2;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	entity->obj_type = MEDIA_ENTITY_TYPE_BASE;
++	if (type != MEM2MEM_ENT_TYPE_PROC) {
++		entity->info.dev.major = VIDEO_MAJOR;
++		entity->info.dev.minor = vdev->minor;
++	}
++	len = strlen(vdev->name) + 2 + strlen(m2m_entity_name[type]);
++	name = kmalloc(len, GFP_KERNEL);
++	if (!name)
++		return -ENOMEM;
++	snprintf(name, len, "%s-%s", vdev->name, m2m_entity_name[type]);
++	entity->name = name;
++	entity->function = function;
++
++	ret = media_entity_pads_init(entity, num_pads, pads);
++	if (ret)
++		return ret;
++	ret = media_device_register_entity(mdev, entity);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int v4l2_m2m_register_media_controller(struct v4l2_m2m_dev *m2m_dev,
++		struct video_device *vdev, int function)
++{
++	struct media_device *mdev = vdev->v4l2_dev->mdev;
++	struct media_link *link;
++	int ret;
++
++	if (!mdev)
++		return 0;
++
++	/* A memory-to-memory device consists in two
++	 * DMA engine and one video processing entities.
++	 * The DMA engine entities are linked to a V4L interface
++	 */
++
++	/* Create the three entities with their pads */
++	m2m_dev->source = &vdev->entity;
++	ret = v4l2_m2m_register_entity(mdev, m2m_dev,
++			MEM2MEM_ENT_TYPE_SOURCE, vdev, MEDIA_ENT_F_IO_V4L);
++	if (ret)
++		return ret;
++	ret = v4l2_m2m_register_entity(mdev, m2m_dev,
++			MEM2MEM_ENT_TYPE_PROC, vdev, function);
++	if (ret)
++		goto err_rel_entity0;
++	ret = v4l2_m2m_register_entity(mdev, m2m_dev,
++			MEM2MEM_ENT_TYPE_SINK, vdev, MEDIA_ENT_F_IO_V4L);
++	if (ret)
++		goto err_rel_entity1;
++
++	/* Connect the three entities */
++	ret = media_create_pad_link(m2m_dev->source, 0, &m2m_dev->proc, 1,
++			MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (ret)
++		goto err_rel_entity2;
++
++	ret = media_create_pad_link(&m2m_dev->proc, 0, &m2m_dev->sink, 0,
++			MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (ret)
++		goto err_rm_links0;
++
++	/* Create video interface */
++	m2m_dev->intf_devnode = media_devnode_create(mdev,
++			MEDIA_INTF_T_V4L_VIDEO, 0,
++			VIDEO_MAJOR, vdev->minor);
++	if (!m2m_dev->intf_devnode) {
++		ret = -ENOMEM;
++		goto err_rm_links1;
++	}
++
++	/* Connect the two DMA engines to the interface */
++	link = media_create_intf_link(m2m_dev->source,
++			&m2m_dev->intf_devnode->intf,
++			MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (!link) {
++		ret = -ENOMEM;
++		goto err_rm_devnode;
++	}
++
++	link = media_create_intf_link(&m2m_dev->sink,
++			&m2m_dev->intf_devnode->intf,
++			MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (!link) {
++		ret = -ENOMEM;
++		goto err_rm_intf_link;
++	}
++	return 0;
++
++err_rm_intf_link:
++	media_remove_intf_links(&m2m_dev->intf_devnode->intf);
++err_rm_devnode:
++	media_devnode_remove(m2m_dev->intf_devnode);
++err_rm_links1:
++	media_entity_remove_links(&m2m_dev->sink);
++err_rm_links0:
++	media_entity_remove_links(&m2m_dev->proc);
++	media_entity_remove_links(m2m_dev->source);
++err_rel_entity2:
++	media_device_unregister_entity(&m2m_dev->proc);
++	kfree(m2m_dev->proc.name);
++err_rel_entity1:
++	media_device_unregister_entity(&m2m_dev->sink);
++	kfree(m2m_dev->sink.name);
++err_rel_entity0:
++	media_device_unregister_entity(m2m_dev->source);
++	kfree(m2m_dev->source->name);
++	return ret;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(v4l2_m2m_register_media_controller);
++#endif
++
+ struct v4l2_m2m_dev *v4l2_m2m_init(const struct v4l2_m2m_ops *m2m_ops)
+ {
+ 	struct v4l2_m2m_dev *m2m_dev;
+diff --git a/include/media/v4l2-mem2mem.h b/include/media/v4l2-mem2mem.h
+index 8f4b208cfee7..af48b1eca025 100644
+--- a/include/media/v4l2-mem2mem.h
++++ b/include/media/v4l2-mem2mem.h
+@@ -47,6 +47,7 @@ struct v4l2_m2m_ops {
+ 	void (*job_abort)(void *priv);
+ };
+ 
++struct video_device;
+ struct v4l2_m2m_dev;
+ 
+ /**
+@@ -322,6 +323,24 @@ int v4l2_m2m_mmap(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+  */
+ struct v4l2_m2m_dev *v4l2_m2m_init(const struct v4l2_m2m_ops *m2m_ops);
+ 
++#if defined(CONFIG_MEDIA_CONTROLLER)
++void v4l2_m2m_unregister_media_controller(struct v4l2_m2m_dev *m2m_dev);
++int v4l2_m2m_register_media_controller(struct v4l2_m2m_dev *m2m_dev,
++			struct video_device *vdev, int function);
++#else
++static inline void
++v4l2_m2m_unregister_media_controller(struct v4l2_m2m_dev *m2m_dev)
++{
++}
++
++static inline int
++v4l2_m2m_register_media_controller(struct v4l2_m2m_dev *m2m_dev,
++		struct video_device *vdev, int function)
++{
++	return 0;
++}
++#endif
++
+ /**
+  * v4l2_m2m_release() - cleans up and frees a m2m_dev structure
+  *
+-- 
+2.18.0
+

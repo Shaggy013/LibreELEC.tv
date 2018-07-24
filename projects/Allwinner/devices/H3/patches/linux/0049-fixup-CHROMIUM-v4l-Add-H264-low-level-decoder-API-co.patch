@@ -1,0 +1,100 @@
+From aa2c6cdd2ca70afdfcc26f3b3d11bb77f0f0545b Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime.ripard@bootlin.com>
+Date: Thu, 12 Jul 2018 17:04:41 +0200
+Subject: [PATCH 49/55] fixup! CHROMIUM: v4l: Add H264 low-level decoder API
+ compound controls.
+
+---
+ drivers/media/v4l2-core/v4l2-ctrls.c | 20 ++++++++++----------
+ include/uapi/linux/v4l2-controls.h   |  4 ++--
+ include/uapi/linux/videodev2.h       |  4 ++--
+ 3 files changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls.c b/drivers/media/v4l2-core/v4l2-ctrls.c
+index b0bfdedd8456..ae00889eb7ab 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls.c
+@@ -828,8 +828,8 @@ const char *v4l2_ctrl_get_name(u32 id)
+ 	case V4L2_CID_MPEG_VIDEO_H264_SPS:			return "H264 SPS";
+ 	case V4L2_CID_MPEG_VIDEO_H264_PPS:			return "H264 PPS";
+ 	case V4L2_CID_MPEG_VIDEO_H264_SCALING_MATRIX:		return "H264 Scaling Matrix";
+-	case V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAM:		return "H264 Slice Parameters";
+-	case V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAM:		return "H264 Decode Parameters";
++	case V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAMS:		return "H264 Slice Parameters";
++	case V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAMS:		return "H264 Decode Parameters";
+ 	case V4L2_CID_MPEG_VIDEO_MPEG4_I_FRAME_QP:		return "MPEG4 I-Frame QP Value";
+ 	case V4L2_CID_MPEG_VIDEO_MPEG4_P_FRAME_QP:		return "MPEG4 P-Frame QP Value";
+ 	case V4L2_CID_MPEG_VIDEO_MPEG4_B_FRAME_QP:		return "MPEG4 B-Frame QP Value";
+@@ -1310,11 +1310,11 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
+ 	case V4L2_CID_MPEG_VIDEO_H264_SCALING_MATRIX:
+ 		*type = V4L2_CTRL_TYPE_H264_SCALING_MATRIX;
+ 		break;
+-	case V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAM:
+-		*type = V4L2_CTRL_TYPE_H264_SLICE_PARAM;
++	case V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAMS:
++		*type = V4L2_CTRL_TYPE_H264_SLICE_PARAMS;
+ 		break;
+-	case V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAM:
+-		*type = V4L2_CTRL_TYPE_H264_DECODE_PARAM;
++	case V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAMS:
++		*type = V4L2_CTRL_TYPE_H264_DECODE_PARAMS;
+ 		break;
+ 	default:
+ 		*type = V4L2_CTRL_TYPE_INTEGER;
+@@ -1676,8 +1676,8 @@ static int std_validate(const struct v4l2_ctrl *ctrl, u32 idx,
+ 	case V4L2_CTRL_TYPE_H264_SPS:
+ 	case V4L2_CTRL_TYPE_H264_PPS:
+ 	case V4L2_CTRL_TYPE_H264_SCALING_MATRIX:
+-	case V4L2_CTRL_TYPE_H264_SLICE_PARAM:
+-	case V4L2_CTRL_TYPE_H264_DECODE_PARAM:
++	case V4L2_CTRL_TYPE_H264_SLICE_PARAMS:
++	case V4L2_CTRL_TYPE_H264_DECODE_PARAMS:
+ 		return 0;
+ 
+ 	default:
+@@ -2266,10 +2266,10 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
+ 	case V4L2_CTRL_TYPE_H264_SCALING_MATRIX:
+ 		elem_size = sizeof(struct v4l2_ctrl_h264_scaling_matrix);
+ 		break;
+-	case V4L2_CTRL_TYPE_H264_SLICE_PARAM:
++	case V4L2_CTRL_TYPE_H264_SLICE_PARAMS:
+ 		elem_size = sizeof(struct v4l2_ctrl_h264_slice_param);
+ 		break;
+-	case V4L2_CTRL_TYPE_H264_DECODE_PARAM:
++	case V4L2_CTRL_TYPE_H264_DECODE_PARAMS:
+ 		elem_size = sizeof(struct v4l2_ctrl_h264_decode_param);
+ 		break;
+ 	default:
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index cc59a3b99a50..350d18d884d5 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -536,8 +536,8 @@ enum v4l2_mpeg_video_h264_hierarchical_coding_type {
+ #define V4L2_CID_MPEG_VIDEO_H264_SPS		(V4L2_CID_MPEG_BASE+383)
+ #define V4L2_CID_MPEG_VIDEO_H264_PPS		(V4L2_CID_MPEG_BASE+384)
+ #define V4L2_CID_MPEG_VIDEO_H264_SCALING_MATRIX	(V4L2_CID_MPEG_BASE+385)
+-#define V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAM	(V4L2_CID_MPEG_BASE+386)
+-#define V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAM	(V4L2_CID_MPEG_BASE+387)
++#define V4L2_CID_MPEG_VIDEO_H264_SLICE_PARAMS	(V4L2_CID_MPEG_BASE+386)
++#define V4L2_CID_MPEG_VIDEO_H264_DECODE_PARAMS	(V4L2_CID_MPEG_BASE+387)
+ 
+ #define V4L2_CID_MPEG_VIDEO_MPEG4_I_FRAME_QP	(V4L2_CID_MPEG_BASE+400)
+ #define V4L2_CID_MPEG_VIDEO_MPEG4_P_FRAME_QP	(V4L2_CID_MPEG_BASE+401)
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 9d01fa5e27b5..340865ff7e64 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -1645,8 +1645,8 @@ enum v4l2_ctrl_type {
+ 	V4L2_CTRL_TYPE_H264_SPS      = 0x0104,
+ 	V4L2_CTRL_TYPE_H264_PPS      = 0x0105,
+ 	V4L2_CTRL_TYPE_H264_SCALING_MATRIX = 0x0106,
+-	V4L2_CTRL_TYPE_H264_SLICE_PARAM = 0x0107,
+-	V4L2_CTRL_TYPE_H264_DECODE_PARAM = 0x0108,
++	V4L2_CTRL_TYPE_H264_SLICE_PARAMS = 0x0107,
++	V4L2_CTRL_TYPE_H264_DECODE_PARAMS = 0x0108,
+ };
+ 
+ /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */
+-- 
+2.18.0
+
