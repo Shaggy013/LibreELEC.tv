@@ -17,7 +17,8 @@ devices = {
       'orangepi_pc': { 'dtb': 'sun8i-h3-orangepi-pc.dtb', 'config': 'orangepi_pc_defconfig' },
       'orangepi_pc_plus': { 'dtb': 'sun8i-h3-orangepi-pc-plus.dtb', 'config': 'orangepi_pc_plus_defconfig' },
       'orangepi_plus2e': { 'dtb': 'sun8i-h3-orangepi-plus2e.dtb', 'config': 'orangepi_plus2e_defconfig' },
-      'orangepi_plus': { 'dtb': 'sun8i-h3-orangepi-plus.dtb', 'config': 'orangepi_plus_defconfig' },
+      'orangepi_plus': { 'dtb': 'sun8i-h3-orangepi-plus.dtb', 'config': 'orangepi_plus_defconfig' },      
+      'beelink_x2x': { 'dtb': 'sun8i-h3-beelink-x2.dtb', 'config': 'beelink_x2_defconfig' },
     },
   },
 
